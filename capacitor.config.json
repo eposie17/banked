@@ -1,0 +1,11 @@
+{
+  "appId": "app.banked.game",
+  "appName": "Banked!",
+  "webDir": "www",
+  "backgroundColor": "#07080c",
+  "ios": {
+    "contentInset": "never",
+    "scrollEnabled": false,
+    "backgroundColor": "#07080c"
+  }
+}

@@ -1,0 +1,1796 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>Banked! v11</title>
+<style>
+:root{color-scheme:dark}
+html,body{height:100%;margin:0;padding:0;background:#07080c;overflow:hidden;overscroll-behavior:none}
+body{position:fixed;inset:0;width:100%;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
+canvas{display:block;width:100%;height:100%;touch-action:none;cursor:crosshair}
+</style></head><body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+// ================= constants =================
+const W=360,H=640,AH=500,STEP=1/120,DECEL=600,HOTV=300,TAU=Math.PI*2;
+// BLUE = short pull: launch 500-740, slows at 700/s (rolls about 170-390), walls keep 98% plus a small kick, so it can bank. It stays HOT down to HEAVY_HOTV.
+// CRUSH only when a blue ball hits at under 700. THUD at the real stop stuns the enemies this blue shot hit and any enemy within THUD_R.
+const HEAVY_V0=500,HEAVY_V1=740,HEAVY_DECEL=700,HEAVY_KEEP=0.98,HEAVY_KICK=40,HEAVY_HOTV=150,CRUSH_V=700,CRUSH=1,KB_HEAVY=700,SPLAT_V=400,THUD_T=0.6,THUD_R=60,STUN_CD=0.6;
+// an enemy within LUNGE_R of a cold ball crouches for LUNGE_CROUCH s, then dashes LUNGE_D at it
+const LUNGE_R=100,LUNGE_D=120,LUNGE_CROUCH=0.3,LUNGE_V=600,LUNGE_CD=1.2;
+// heat 3+: a tank's armoured front turns toward the ball at TANK_TURN (90° a second), so a bank shot can get round it
+const TANK_TURN=Math.PI/2;
+// two flick colours by pull: BLUE = short (heavy physics), GREEN = full. An enemy only takes damage from its own colour; the wrong colour shoves it.
+const TIER_B=0.5,TIER_Y=0.5;
+// blue is dark and green is light, so the two differ in brightness as well as hue (they still read in greyscale).
+// Shapes back them up for everyone: blue things are square, green things are round. STRIPES (a setting) adds stripes to blue things.
+const COLS={b:'#4a78f5',y:'#ffd23f',g:'#8ff26e',w:'#ffffff',x:'#a3abbf',t:'#e9ecf5'};
+const DARKS={b:'#1f3a8f',y:'#8a6a10',g:'#3f8a2c',w:'#777',x:'#4b5164',t:'#5a6074'};
+const TIER_NAME={b:'SHORT PULL',y:'MID',g:'FULL PULL',w:'ANY'};
+const colOf=c=>COLS[c]||'#fff',darkOf=c=>DARKS[c]||'#777';
+const colName=c=>c==='g'?'GREEN':c==='y'?'YELLOW':c==='b'?'BLUE':c==='x'?'GREY':'WHITE';
+const other=c=>c==='b'?'g':'b';
+// 4% of hysteresis so a jittery thumb on the boundary does not flicker between colours
+const tierOf=pw=>pw<TIER_B+(P&&P.tier==='g'?-0.04:0.04)?'b':'g';
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const angDiff=(a,b)=>{let d=(a-b)%TAU;if(d>Math.PI)d-=TAU;if(d<-Math.PI)d+=TAU;return d;};
+const fmt=t=>{t=Math.max(0,t);const m=Math.floor(t/60),s=Math.floor(t%60);return m+':'+(s<10?'0':'')+s;};
+const fmt1=t=>{t=Math.max(0,t);const m=Math.floor(t/60),s=t%60;return m+':'+(s<10?'0':'')+s.toFixed(1);};
+const FONT='system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif';
+const DOORS=[{x:90,y:0,s:2},{x:270,y:0,s:2},{x:0,y:150,s:0},{x:360,y:150,s:1},{x:0,y:350,s:0},{x:360,y:350,s:1}];
+const DOOR_ORDER=[0,3,1,4,2,5];
+// ================= enemies =================
+// ec = the colour that hurts it: g green (full pull), b blue (short pull), t two-tone (half each), e either (the wave picks).
+// noLunge: never lunges. harmless: never bites. solid: the ball bounces off it. kbm: how far hits knock it (0 = never moves when hit).
+// rule: one line for the HUD while the kind is new. d: the longer text for the between-wave screen and practice.
+const ETYPES={
+ runner:{ec:'g',r:11,hp:1,spd:85,name:'RUNNER',rule:'Fast, 1 hit. Needs a full pull.',d:'Fast, 1 hit. Needs a full pull.'},
+ tank:{ec:'b',r:13,hp:3,spd:32,name:'TANK',rule:'Slow, 3 hits. Needs a short pull.',d:'Slow, 3 hits. Needs a short pull. From heat 3 its front is armoured.'},
+ zig:{ec:'e',r:11,hp:2,spd:62,name:'ZIGZAGGER',rule:'It weaves. Hit it as it swings into your line.',d:'Weaves side to side. Shoot when it swings into your line.'},
+ swarm:{ec:'g',r:7,hp:1,spd:95,name:'SWARMLING',rule:'Tiny packs. One long shot through the pack.',d:'Tiny, comes in packs. One long shot through the pack.'},
+ charger:{ec:'b',r:13,hp:3,spd:30,name:'CHARGER',rule:'It glows, then rushes. Make it hit a wall.',d:'Glows, then rushes. If it hits a wall it is dizzy and takes +1 damage.',noLunge:1},
+ shield:{ec:'e',r:12,hp:2,spd:45,name:'SHIELDBEARER',rule:'Its shield faces you. Bank round it.',d:'Holds a shield on the side facing you. Bank round it.'},
+ burrower:{ec:'b',r:12,hp:2,spd:40,name:'BURROWER',rule:'It digs under your ball. Move before it pops up.',d:'Digs down and comes up under your ball 2 s later. Move, or hit it as it comes up.'},
+ splitter:{ec:'e',r:12,hp:2,spd:50,name:'SPLITTER',rule:'It splits into two of the other colour.',d:'Splits into 2 small ones of the other colour when it dies.'},
+ spitter:{ec:'g',r:11,hp:2,spd:45,name:'SPITTER',rule:'It spits at a still ball. Flick through a glob.',d:'Spits at your ball when it sits still. Flick through a glob to send it back.',noLunge:1},
+ twotone:{ec:'t',r:13,hp:2,spd:40,name:'TWO-TONE',rule:'Only the half that matches your ball takes hits.',d:'Half blue, half green. Only the half that matches your ball takes damage.'},
+ medic:{ec:'g',r:11,hp:2,spd:45,name:'MEDIC',rule:'It heals the crowd. Hit it first.',d:'Heals hurt enemies near it. Take it out first.',noLunge:1},
+ flipper:{ec:'e',r:12,hp:3,spd:45,name:'FLIPPER',rule:'It swaps colour every time it is hit.',d:'Swaps colour every time it is hit. Plan one shot of each colour.'},
+ bomber:{ec:'e',r:11,hp:1,spd:55,name:'BOMBER',rule:'It blows up when it dies, hurting enemies.',d:'Blows up when it dies, hurting every enemy close by. If it reaches you, it blows up on you.'},
+ nest:{ec:'b',r:16,hp:4,spd:0,name:'NEST',rule:'It hatches runners until it breaks.',d:'Sits still and hatches a runner every 4 s until it breaks.',noLunge:1,harmless:1,solid:1,kbm:0},
+ // pieces that other enemies make
+ splitling:{ec:'e',r:8,hp:1,spd:90,name:'SPLITLING',bit:1},
+ // boss parts
+ king:{ec:'g',r:24,hp:12,spd:32,name:'KING',boss:1,noLunge:1,solid:1,kbm:0},
+ knight:{ec:'g',r:22,hp:12,spd:0,name:'MIRROR KNIGHT',boss:1,noLunge:1,solid:1,kbm:0},
+ jugg:{ec:'b',r:28,hp:20,spd:0,name:'JUGGERNAUT',boss:1,noLunge:1,solid:1,kbm:0}
+};
+const ENEMY_KEYS=Object.keys(ETYPES).filter(k=>ETYPES[k].rule);
+// the order new kinds arrive in: the first run teaches runners and tanks, then each run brings the next kind in its own intro wave
+const NEW_ORDER=['zig','swarm','charger','shield','burrower','splitter','spitter','twotone','medic','flipper','bomber','nest'];
+// an intro wave: three squads of the new kind, with a few runners and tanks where it needs company
+const INTRO={zig:'zig*2|zig*2 runner|zig*3 tank',swarm:'swarm*5|swarm*5 tank|swarm*6 runner',charger:'charger|charger runner*2|charger*2 runner',
+ shield:'shield*2|shield*2 runner|shield*2 tank runner',burrower:'burrower*2|burrower*2 runner|burrower*2 tank',splitter:'splitter*2|splitter*2|splitter*2 runner',
+ spitter:'spitter*2|spitter*2 runner|spitter*2 tank',twotone:'twotone*2|twotone*2 runner|twotone*2 tank',medic:'tank*2 medic|runner*2 medic|tank runner medic',
+ flipper:'flipper*2|flipper*2 runner|flipper*2 tank',bomber:'bomber*2 runner*2|bomber*2 tank*2|bomber*3 runner*2'};
+// elite twists: BIG (twice the size and hit points) toughens the last wave; GOLDEN is a rare runaway worth an extra pick
+const TWISTS={Big:'Twice the size and hit points.',Golden:'Runs away. Catch it for an extra card pick.'};
+const TWIST_KEYS=Object.keys(TWISTS);
+const TWIST_NAME={Big:'BIG',Golden:'GOLDEN'};
+// ================= waves =================
+// a squad token is type[:colour][+Twist][*count]. '?' is this wave's guest (a kind you have met), 'pair' is a runner holding hands with a tank.
+// tier 0: the fixed first run. tier 1 opens a run, tier 2 comes later. low/gap: the next squad comes when fewer than low are alive and gap s have passed.
+// rule: the one line the HUD shows for the whole wave. slow: enemies walk at this share of their speed.
+const WAVES=[
+ {k:'first1',name:'RUNNERS',tier:0,slow:0.8,rule:'GREEN = FULL PULL: pull all the way back.',desc:'Green runners only. Pull all the way back for a fast green ball.',script:[
+  {d:[0,1],c:'runner*3'},{d:[2,3],c:'runner*3'},{d:[4,5],c:'runner*4'}]},
+ {k:'first2',name:'TANKS',tier:0,slow:0.9,rule:'BLUE = SHORT PULL: a gentle flick crushes.',desc:'Blue tanks join in. A short pull makes a heavy blue ball that crushes them.',script:[
+  {d:[0,1],c:'tank*2'},{d:[2,3],c:'tank runner*2'},{d:[4,5],c:'tank*2 runner*2'},{d:[0,1],c:'runner*2 tank'}]},
+ {k:'rush',name:'RUSH',tier:1,rule:'Every door at once. The last squad is big.',desc:'Runners and tanks from every door, then one big last squad.',script:[
+  {d:[0,1],c:'runner*3 tank'},{d:[2,3],c:'runner*3 ?'},{d:[4,5],c:'tank*2 runner*2'},{d:[0,1,2,3,4,5],c:'runner*4 tank*2 ?',pop:'LAST SQUAD!'}]},
+ {k:'pairs',name:'PAIRS',tier:1,rule:'Each runner holds a tank: one pull of each.',desc:'Every runner holds hands with a tank. Switch pull lengths fast.',script:[
+  {d:[0,1],c:'pair pair'},{d:[2,3],c:'pair pair'},{d:[4,5],c:'pair pair ?'},{d:[0,1,2,3],c:'pair*3'}]},
+ {k:'lanes',name:'LANES',tier:1,rule:'Long walls make lanes. Shoot straight down them.',desc:'Long walls split the room into lanes. Shoot straight down them.',
+  blocks:[{x:114,y:110,w:12,h:300},{x:234,y:110,w:12,h:300}],script:[
+  {d:[0,1],c:'runner*3 tank'},{d:[2,3],c:'runner*4'},{d:[0,1],c:'tank*2 ? ?'},{d:[4,5],c:'runner*3 tank*2'}]},
+ {k:'escort',name:'ESCORT',tier:2,need:'medic',rule:'A Medic heals the crowd. Hit it first.',desc:'A Medic hides in each crowd and heals it. Pick the right target first.',script:[
+  {d:[0],c:'tank tank medic tank'},{d:[1],c:'runner*2 medic runner*2'},{d:[2,3],c:'? ? runner tank'},{d:[4,5],c:'tank runner medic runner tank'}]},
+ {k:'ring',name:'CLOSING RING',tier:2,rule:'A ring closes in. Break out through a gap.',desc:'A ring of enemies appears round your ball and closes in. Break out before it shuts.',script:[
+  {ring:1,c:'runner tank runner tank runner tank runner tank'},{ring:1,gap:1.5,c:'runner zig:b runner ? runner zig:b runner ?'}]},
+ {k:'fortress',name:'FORTRESS',tier:2,rule:'Tanks sit behind blocks. Bank in through the gaps.',desc:'Tanks sit inside a ring of blocks. Bank shots through the corners.',
+  blocks:[{x:128,y:40,w:104,h:12},{x:128,y:156,w:104,h:12},{x:84,y:66,w:12,h:76},{x:264,y:66,w:12,h:76}],
+  place:[{t:'tank',x:150,y:96,hold:1},{t:'tank',x:210,y:96,hold:1},{t:'tank',x:180,y:128,hold:1}],
+  script:[{d:[4,5],c:'runner*3'},{d:[2,3],c:'runner*2 ? ?'},{d:[4,5],c:'runner*2 tank*2'}]},
+ {k:'sliding',name:'SLIDING WALLS',tier:2,rule:'The grey blocks slide. Time your bank shots.',desc:'The grey blocks slide back and forth. Time your bank shots.',
+  blocks:[{x:40,y:150,w:110,h:14,mv:{a:20,b:230,spd:45}},{x:210,y:350,w:110,h:14,mv:{a:20,b:230,spd:-45}}],script:[
+  {d:[0,1],c:'runner*2 tank*2'},{d:[2,3],c:'runner*3 ?'},{d:[4,5],c:'tank*2 runner*2'},{d:[0,1],c:'? runner*3'}]},
+ {k:'trick',name:'TRICK SHOT',tier:2,rule:'Five in a line: get all five in one flick.',desc:'Five stand still in a line, three times. One bank shot can get them all.',trick:1,script:[]},
+ {k:'hives',name:'HIVES',tier:2,need:'nest',hives:1,rule:'Break all three Nests to clear the room.',desc:'Three Nests hatch runners. Break all three to clear the room.',
+  place:[{t:'nest',x:60,y:70},{t:'nest',x:300,y:70},{t:'nest',x:180,y:440}],script:[{d:[2,3],gap:6,c:'? ?'}]},
+ {k:'flip',name:'COLOUR FLIP',tier:2,flip:1,noGuest:['flipper','twotone'],rule:'All green now. Halfway, everything turns blue.',desc:'Everything is green. Halfway through, everything turns blue.',script:[
+  {d:[0,1],c:'runner*4'},{d:[2,3],c:'zig*2 runner*2'},{d:[4,5],c:'runner*3 ?'},{d:[0,1],c:'runner*4'},{d:[2,3,4,5],c:'zig*2 runner*2 ?'}]}
+];
+// ================= bosses =================
+const BOSSES={
+ kings:{name:'TWIN KINGS',tip:'Kill both kings within 8 s of each other.',d:'A blue king and a green king. Kill both within 8 s of each other, or the dead one comes back. When one falls, the other rages.'},
+ wall:{name:'THE WALL',tip:'Bounce off a wall first, then hit its top.',d:'A huge block that slides toward you. Its weak spot is on its back, so only a ball that has bounced off something first can hurt it. Phase 2: faster.'},
+ knight:{name:'MIRROR KNIGHT',tip:'Flick hard: it copies you and crashes.',d:'Copies each flick you make, mirrored. When it crashes into a wall it is dizzy for 3 s: hit it then. Phase 2: faster.'},
+ jugg:{name:'JUGGERNAUT',tip:'Its armour cracks after every charge: hit the crack.',d:'Aims, then charges across the room. Every charge ends in a crack in its armour: hit it then. Dodge the charge to keep your hearts. Phase 2: charges twice.'}
+};
+const BOSS_KEYS=Object.keys(BOSSES);
+const PHASE2={kings:'THE KING RAGES',wall:'THE WALL SPEEDS UP',knight:'THE KNIGHT GETS FASTER',jugg:'DOUBLE CHARGE'};
+const heatMult=h=>1+0.5*(h-1),HEAT_MAX=5;
+// each heat adds one rule and keeps the ones below it
+const HEAT_RULES=['Normal rules','Wrong-colour hits reset your chain','Tanks block hits from the front','No healing between waves','One enemy in every squad is Big'];
+// points needed to reach level n+1 from level n
+const lvlNeed=n=>600*n+200*n*n;
+// squads: the next squad comes when fewer than SQUAD_LOW are alive, at least SQUAD_GAP s after the last
+const SQUAD_LOW=3,SQUAD_GAP=2;
+let rnd=Math.random;
+// DAILY RUN: one seeded stream (mulberry32). Its state rs is saved with the run. Each wave, boss and card screen reseeds from
+// the day's seed, so the waves, guests, Golden enemies and card offers are the same for everyone that day whatever happened before.
+let rs=1;
+const seeded=()=>{rs=rs+0x6D2B79F5|0;let t=Math.imul(rs^rs>>>15,1|rs);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};
+function reseed(k){if(R&&R.daily){rs=(R.daily.seed^Math.imul(k+1,0x9E3779B1))|0;rnd=seeded;}}
+const hashStr=s=>{let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619);}return h|0;};
+// the day in UTC, so everyone gets the same daily run at the same moment
+const todayKey=()=>new Date().toISOString().slice(0,10);
+const pickR=a=>a[Math.floor(rnd()*a.length)];
+function shuffleR(a){for(let i=a.length-1;i>0;i--){const j=Math.floor(rnd()*(i+1));[a[i],a[j]]=[a[j],a[i]];}return a;}
+
+// ================= abilities =================
+// Three families. BALL changes your ball (no limit). TERRAIN adds something to the room; the game places it (3 kinds at most).
+// POWER-UP: a pickup that appears now and then (3 types at most). A pickup is blue or green: only a ball of that colour grabs it,
+// and its effect takes that colour. RAINBOW STAR is wild: white, and any ball grabs it. Every card has 3 levels; level 3 adds a twist.
+const FAM={BALL:{name:'BALL',col:'#ff8a3c'},TERRAIN:{name:'TERRAIN',col:'#d6bd8c'},POWER:{name:'POWER-UP',col:'#d07cff'}};
+const CAP={TERRAIN:3,POWER:3},FAM_ORDER={BALL:0,TERRAIN:1,POWER:2};
+const CARDS={
+ Splitter:{fam:'BALL',name:'SPLITTER',d:['Your first hit throws off 2 mini balls in your colour','Your first hit throws off 3 mini balls','Plus: mini balls split again on their first hit']},
+ Heavy:{fam:'BALL',name:'HEAVY BALL',d:['Bigger ball. Hits do +1 damage and knock enemies twice as far','Even bigger, and knocks enemies further','Plus: enemies it knocks into a wall take 2 damage']},
+ Fireball:{fam:'BALL',name:'FIREBALL',d:['Leaves a fire trail that burns enemies of your colour','The fire trail lasts longer','The fire trail lasts twice as long']},
+ Blast:{fam:'BALL',name:'BLAST BALL',d:['Explodes when it stops, hurting your colour nearby','Bigger blast','Plus: also explodes on its first wall bounce']},
+ Shield:{fam:'BALL',name:'SHIELD',d:['A shield blocks one bite, then grows back after 8 s','Grows back after 6 s','Blocks two bites']},
+ Ghost:{fam:'BALL',name:'GHOST BALL',d:['Passes straight through enemies of the other colour','Each enemy you pass through adds +1 to your chain','Plus: passes through the grey blocks too']},
+ Chameleon:{fam:'BALL',name:'CHAMELEON',d:['Swaps colour every time it bounces off a wall','Also swaps on posts and blocks','The 3rd swap turns it white: it hits any colour']},
+ Snowball:{fam:'BALL',name:'SNOWBALL',d:['Each hit in one flick makes it bigger and +1 harder (2 max)','Grows up to 3 times','Grows up to 4 times and keeps half into the next flick']},
+ Bouncy:{fam:'TERRAIN',name:'BOUNCY WALLS',d:['Walls kick the ball back faster','Walls kick even harder','Plus: your first wall bounce sends a shockwave in your colour']},
+ Posts:{fam:'TERRAIN',name:'POSTS',d:['2 posts. The ball bounces off them at full speed','3 posts','Plus: a hit post zaps nearby enemies of your colour']},
+ Wrap:{fam:'TERRAIN',name:'WRAP HOLES',d:['Holes in the side walls: go in one side, out the other. Enemies too','A second pair of side holes','Plus: holes in the top and bottom walls']},
+ Kegs:{fam:'TERRAIN',name:'POWDER KEGS',d:['2 kegs. Hit one and it blows up, hurting your colour','3 kegs, bigger blasts','Plus: one keg sets off the others nearby']},
+ Thorns:{fam:'TERRAIN',name:'THORN WALLS',d:['Enemies of your colour knocked into a wall take 1 damage','Wall slams do 2 damage','Plus: wall bounces zap your colour along that wall']},
+ Ice:{fam:'TERRAIN',name:'ICE PATCHES',d:['2 ice patches. The ball barely slows on ice: short pulls go far','3 bigger patches','Plus: enemies slip and slide on ice too']},
+ Bomb:{fam:'POWER',name:'BOMB',d:['Blows up in a wide ring, hurting your colour','Bigger ring, 3 damage','Plus: leaves a fire patch for 3 s']},
+ Slowdown:{fam:'POWER',name:'SLOWDOWN',d:['Every enemy moves at a third of its speed for 4 s','Lasts 5 s','Plus: each kill during it adds half a second']},
+ Gold:{fam:'POWER',name:'GOLD COIN',d:['Double score and XP for 6 s','Lasts 8 s','Plus: each kill during it scores +50 more']},
+ TimeStop:{fam:'POWER',name:'TIME STOP',d:['Everything but your ball freezes for 2 s','Lasts 2.5 s','Lasts 3 s, and frozen enemies take double damage']},
+ Freeze:{fam:'POWER',name:'FREEZE',d:['Enemies nearby freeze for 3 s and slide like pucks when hit','Bigger ring, 4 s','Plus: frozen enemies of your colour shatter on walls']},
+ Tilt:{fam:'POWER',name:'TILT',d:['The floor tips: every enemy slides to one wall for 3 s','Lasts 4 s, slides faster','Plus: enemies of your colour that hit the wall take 1 damage']},
+ Twin:{fam:'POWER',name:'TWIN',d:['A ball in the other colour copies your next 3 flicks, mirrored','Copies 4 flicks','Copies 5 flicks']},
+ BankBonus:{fam:'POWER',name:'BANK BONUS',d:['Bank shots (wall, then enemy) do triple damage for 6 s','Lasts 8 s','Plus: two walls first means five times the damage']},
+ Domino:{fam:'POWER',name:'DOMINO',d:['For 5 s every kill explodes, hurting the same colour nearby','Lasts 7 s, bigger blasts','Plus: each link in the chain blows up bigger']},
+ Paint:{fam:'POWER',name:'PAINT BUCKET',d:['Every enemy turns your colour for 4 s','Lasts 5 s','Lasts 6 s']},
+ Star:{fam:'POWER',name:'RAINBOW STAR',wild:true,d:['Your ball hits any colour for 4 s. Rare','Lasts 5 s','Lasts 6 s, and each kill scores +50 more']},
+ Multi:{fam:'POWER',name:'MULTIBALL',d:['2 extra balls in your colour bounce around for 6 s','3 extra balls','4 extra balls']},
+ Jar:{fam:'POWER',name:'LIGHTNING JAR',d:['Lightning jumps between 4 enemies of your colour','Jumps 6 times','Jumps 8 times and stuns the last one']}
+};
+const CARD_KEYS=Object.keys(CARDS),famOf=k=>CARDS[k].fam;
+// a new player starts with 14 cards: 4 ball, 4 terrain, 6 power-ups (five combos work among them: Pinball, Napalm, Shrapnel, Fuse, Wildfire).
+// Each finished run unlocks the next card in CARD_UNLOCK. Practice and the daily run use every card.
+const STARTER=['Splitter','Heavy','Fireball','Shield','Bouncy','Posts','Kegs','Thorns','Bomb','Slowdown','BankBonus','Domino','Multi','Gold'];
+const CARD_UNLOCK=['Jar','Ice','Freeze','Snowball','Wrap','Tilt','Blast','Ghost','Chameleon','TimeStop','Twin','Paint','Star'];
+const cardOn=k=>(R&&(R.practice||R.daily))||STARTER.includes(k)||CARD_UNLOCK.indexOf(k)<META.cardsN;
+// seconds between pickups of one power-up type, by its level
+const puEvery=(k,L)=>(k==='Star'?[24,20,16]:[14,12,10])[clamp(L|0,1,3)-1];
+// two cards owned together switch on a combo
+const COMBOS=[
+ {name:'PINBALL',a:'Splitter',b:'Posts',d:'Mini balls bounce off posts and zap'},
+ {name:'NAPALM',a:'Fireball',b:'Kegs',d:'Kegs leave fire that burns both colours'},
+ {name:'SHRAPNEL',a:'Splitter',b:'Kegs',d:'Kegs burst into mini balls'},
+ {name:'BOWLING NIGHT',a:'Heavy',b:'Freeze',d:'Frozen enemies you hit knock others down'},
+ {name:'GLACIER',a:'Ice',b:'Freeze',d:'Frozen enemies glide on ice, then shatter'},
+ {name:'TIP IT',a:'Thorns',b:'Tilt',d:'Tilt grinds enemies on thorns, any colour'},
+ {name:'FLIP SIDE',a:'Chameleon',b:'Wrap',d:'Wrap holes swap your ball\'s colour'},
+ {name:'AVALANCHE',a:'Snowball',b:'Ice',d:'Rolling over ice grows the snowball'},
+ {name:'FUSE',a:'Kegs',b:'Bomb',d:'A bomb sets off every keg in the room'},
+ {name:'WILDFIRE',a:'Fireball',b:'Domino',d:'Domino blasts leave fire'}
+];
+const hasCombo=nm=>{const c=COMBOS.find(c=>c.name===nm);return !!(c&&R&&R.upg[c.a]&&R.upg[c.b]);};
+// the combos that picking k would switch on now
+const combosFor=k=>R?COMBOS.filter(c=>(c.a===k&&R.upg[c.b]&&!R.upg[c.a])||(c.b===k&&R.upg[c.a]&&!R.upg[c.b])):[];
+const BUMP_SPOTS=[[180,130],[100,320],[260,350],[70,200],[290,235]];
+const ICE_SPOTS=[[92,128],[268,372],[268,128]];
+// the ball barely slows on ice. Pickups: radius, seconds on the floor, most at once.
+const ICE_DECEL=60,PU_R=13,PU_LIFE=6.5,PU_MAX=3;
+
+// ================= canvas =================
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+let dpr=1,sc=1,ox=0,oy=0,vw=1,vh=1;
+// the game fits inside the phone's safe area (clear of the notch, Dynamic Island and home bar); a hidden probe reads its size
+const SAFE=document.createElement('div');SAFE.style.cssText='position:fixed;left:0;top:0;visibility:hidden;pointer-events:none;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)';document.body.appendChild(SAFE);
+function safeIn(){try{const s=getComputedStyle(SAFE);return [s.paddingTop,s.paddingRight,s.paddingBottom,s.paddingLeft].map(v=>parseFloat(v)||0);}catch(e){return [0,0,0,0];}}
+function resize(){vw=window.innerWidth||1;vh=window.innerHeight||1;dpr=Math.min(window.devicePixelRatio||1,2);
+ cv.width=Math.max(1,Math.round(vw*dpr));cv.height=Math.max(1,Math.round(vh*dpr));cv.style.width=vw+'px';cv.style.height=vh+'px';
+ const [st,sr,sb,sl]=safeIn(),aw=Math.max(1,vw-sl-sr),ah=Math.max(1,vh-st-sb);
+ sc=Math.min(aw/W,ah/H);ox=sl+(aw-W*sc)/2;oy=st+(ah-H*sc)/2;}
+window.addEventListener('resize',resize);resize();
+const toL=ev=>({x:(ev.clientX-ox)/sc,y:(ev.clientY-oy)/sc});
+
+// ================= progress: XP workshop =================
+// XP = score / 10 x heat bonus, earned at the end of every run and spent on the title screen. Saved on this device only.
+const TRACKS=[
+ {k:'hearts',name:'HEARTS',d:'+1 heart',max:3},
+ {k:'size',name:'BIG BALL',d:'Bigger ball',max:3},
+ {k:'speed',name:'SPEED',d:'+6% launch speed',max:3},
+ {k:'slow',name:'SLOW-MO',d:'Enemies move even slower while you aim',max:3},
+ {k:'aim',name:'AIM LINE',d:'Shows one more bounce',max:2},
+ {k:'tools',name:'GATE TOOLS',d:'Reroll → Banish → Lock',max:3}
+];
+const COST=[70,130,200];
+// seen: kinds met in an intro wave. named: kinds whose name has been shown on their first body. tut: the first run's two lessons are done.
+// hints: wrong-colour hints shown so far (they stop after HINT_MAX). lastBoss: so the next run picks a different one.
+// daily: {day, best, tries} for the latest daily run played
+// cardsN: cards unlocked beyond the starter 14. newOk: the next run may bring a new enemy (you reached a boss since the last one).
+const META={xp:0,earned:0,lv:{hearts:0,size:0,speed:0,slow:0,aim:0,tools:0},heat:1,heatMax:1,runs:0,seen:[],named:[],tut:false,hints:0,lastBoss:'',daily:null,cardsN:0,newOk:true};
+const HINT_MAX=12;
+const lv=k=>META.lv[k]||0;
+// a workshop level as it counts in the current run: a daily run ignores the workshop so everyone starts equal
+const lvR=k=>R&&R.daily?0:lv(k);
+function buyTrack(k){const t=TRACKS.find(t=>t.k===k);const l=lv(k);if(l>=t.max)return false;const c=COST[l];if(META.xp<c){sfx.cancel();return false;}META.xp-=c;META.lv[k]=l+1;save();sfx.pick();vib(10);return true;}
+// PRACTICE: the abilities and levels picked on the practice screen, kept between visits
+const LAB={};
+// PRACTICE: which tab, enemy, twist, colour, wave and boss are picked
+const LABSEL={tab:'abilities',enemy:'zig',twist:'',col:'mixed',wave:'rush',boss:'kings'};
+function labRoom(k){const f=famOf(k);if(!CAP[f]||LAB[k])return true;let n=0;for(const q in LAB)if(LAB[q]&&famOf(q)===f)n++;return n<CAP[f];}
+// ================= settings / bests =================
+// shake: 2 full, 1 low, 0 off. fewFlash: softer damage and wall flashes. vol: 2 normal, 1 low (sound on/off is separate).
+const SET={pull:120,push:false,sound:true,vol:2,vib:true,shake:2,fewFlash:false,cb:false};
+// last input was a touch: hide keyboard hints
+let lastTouch=false;try{lastTouch=!!(window.matchMedia&&window.matchMedia('(pointer: coarse)').matches);}catch(e){}
+const BEST={time:0,chain:0,score:0,runs:0};
+// SAVED: the run saved at the last card screen or wave start (see saveRun), or null
+let SAVED=null;
+function load(){const get=k=>{try{return JSON.parse(localStorage.getItem('banked9.'+k)||'null');}catch(e){return null;}};
+ const s=get('set');if(s&&typeof s==='object'){for(const k in SET)if(k in s)SET[k]=s[k];if(s.lessShake&&!('shake' in s))SET.shake=1;}
+ else{try{if(window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches){SET.shake=1;SET.fewFlash=true;}}catch(e){}}
+ if(![90,120,160].includes(SET.pull))SET.pull=120;SET.shake=clamp(SET.shake|0,0,2);SET.vol=SET.vol===1?1:2;
+ const b=get('best');if(b&&typeof b==='object')Object.assign(BEST,b);
+ const m=get('meta');if(m&&typeof m==='object'){Object.assign(META,m);META.lv=Object.assign({hearts:0,size:0,speed:0,slow:0,aim:0,tools:0},m.lv||{});for(const t of TRACKS)META.lv[t.k]=clamp(META.lv[t.k]|0,0,t.max);META.xp=Math.max(0,META.xp|0);META.heatMax=clamp(META.heatMax|0,1,5);META.heat=clamp(META.heat|0,1,META.heatMax);
+  META.seen=Array.isArray(m.seen)?m.seen.filter(k=>NEW_ORDER.includes(k)):[];META.named=Array.isArray(m.named)?m.named.filter(k=>ETYPES[k]):[];META.tut=!!m.tut;META.hints=Math.max(0,m.hints|0);META.lastBoss=BOSSES[m.lastBoss]?m.lastBoss:'';META.runs=Math.max(0,m.runs|0);
+  META.cardsN=clamp(('cardsN' in m?m.cardsN:m.runs)|0,0,CARD_UNLOCK.length);META.newOk=m.newOk!==false;
+  const d=m.daily;META.daily=d&&typeof d==='object'&&typeof d.day==='string'?{day:d.day,best:Math.max(0,d.best|0),tries:Math.max(0,d.tries|0)}:null;}
+ const rv=get('run');SAVED=runOk(rv)?rv:null;
+ const l=get('lab');if(l&&typeof l==='object')for(const k in l)if(CARDS[k]&&(l[k]|0)>0&&labRoom(k))LAB[k]=clamp(l[k]|0,1,3);
+ const ls=get('labsel');if(ls&&typeof ls==='object'){Object.assign(LABSEL,ls);if(!ENEMY_KEYS.includes(LABSEL.enemy))LABSEL.enemy='zig';if(!TWISTS[LABSEL.twist])LABSEL.twist='';if(!WAVES.some(w=>w.k===LABSEL.wave))LABSEL.wave='rush';if(!BOSSES[LABSEL.boss])LABSEL.boss='kings';if(!['abilities','enemies','waves','bosses'].includes(LABSEL.tab))LABSEL.tab='abilities';}}
+function save(){try{localStorage.setItem('banked9.set',JSON.stringify(SET));localStorage.setItem('banked9.best',JSON.stringify(BEST));localStorage.setItem('banked9.meta',JSON.stringify(META));localStorage.setItem('banked9.lab',JSON.stringify(LAB));localStorage.setItem('banked9.labsel',JSON.stringify(LABSEL));}catch(e){}}
+load();
+
+// ================= audio =================
+let AC=null,NBUF=null;
+function audioInit(){if(AC){if(AC.state==='suspended')AC.resume().catch(()=>{});return;}try{AC=new (window.AudioContext||window.webkitAudioContext)();const n=AC.sampleRate|0;NBUF=AC.createBuffer(1,n,AC.sampleRate);const d=NBUF.getChannelData(0);for(let i=0;i<n;i++)d[i]=Math.random()*2-1;}catch(e){AC=null;}
+ if(AC&&AC.state==='suspended')AC.resume().catch(()=>{});}
+const volK=()=>SET.vol===1?0.4:1;
+function tone(f,d,type,vol,fEnd,delay){if(!AC||!SET.sound)return;vol*=volK();try{const t=AC.currentTime+(delay||0);const o=AC.createOscillator(),g=AC.createGain();o.type=type||'sine';o.frequency.setValueAtTime(f,t);if(fEnd)o.frequency.exponentialRampToValueAtTime(fEnd,t+d);
+ g.gain.setValueAtTime(vol,t);g.gain.exponentialRampToValueAtTime(0.0005,t+d);o.connect(g);g.connect(AC.destination);o.start(t);o.stop(t+d+0.03);}catch(e){}}
+function noise(d,vol,cut){if(!AC||!SET.sound||!NBUF)return;vol*=volK();try{const t=AC.currentTime;const s=AC.createBufferSource();s.buffer=NBUF;const f=AC.createBiquadFilter();f.type='lowpass';f.frequency.value=cut;const g=AC.createGain();g.gain.setValueAtTime(vol,t);g.gain.exponentialRampToValueAtTime(0.0005,t+d);
+ s.connect(f);f.connect(g);g.connect(AC.destination);s.start(t,Math.random()*0.5);s.stop(t+d+0.02);}catch(e){}}
+const sfx={
+ hit:c=>tone(220*Math.pow(2,Math.min(c,30)/12),0.06,'sine',0.16),
+ kill:()=>noise(0.06,0.18,500),
+ wall:()=>tone(160,0.09,'square',0.07),
+ bank:()=>{tone(330,0.04,'square',0.1);tone(440,0.04,'square',0.1,null,0.045);},
+ skid:()=>noise(0.12,0.22,400),
+ damage:()=>tone(80,0.2,'sawtooth',0.2),
+ launch:()=>tone(300,0.08,'sine',0.16,120),
+ pick:()=>tone(520,0.05,'square',0.09),
+ click:t=>tone(380+t*110,0.025,'sine',0.06),
+ cancel:()=>tone(200,0.04,'sine',0.05),
+ clank:()=>{tone(900,0.08,'square',0.07,480);noise(0.05,0.1,1200);},
+ bell:hi=>{tone(hi?1320:880,0.4,'sine',0.14);tone(hi?1980:1320,0.4,'sine',0.07);},
+ boom:()=>{noise(0.2,0.3,240);tone(90,0.2,'sine',0.2,40);},
+ pop:()=>{noise(0.08,0.16,700);tone(160,0.08,'sine',0.1,70);},
+ roar:()=>{tone(70,0.6,'sawtooth',0.22,45);noise(0.4,0.2,320);},
+ stomp:()=>tone(60,0.25,'square',0.14,30),
+ clear:()=>[523,659,784,1046].forEach((f,i)=>tone(f,0.12,'sine',0.11,null,i*0.08)),
+ small:()=>tone(600,0.03,'sine',0.05),
+ thud:()=>{noise(0.1,0.25,200);tone(60,0.12,'sine',0.2,35);},
+ thunk:()=>{tone(130,0.06,'sine',0.16,90);noise(0.04,0.08,300);},
+ crush:()=>tone(90,0.12,'sine',0.22,50),
+ splat:()=>noise(0.05,0.15,600),
+ thudHeavy:()=>{tone(60,0.15,'sine',0.2);noise(0.08,0.12,300);},
+ launchHeavy:()=>tone(220,0.1,'sine',0.16,90),
+ lunge:()=>tone(150,0.07,'sawtooth',0.07,280),
+ zap:()=>{tone(1200,0.07,'sawtooth',0.07,300);noise(0.09,0.12,2600);},
+ coin:()=>{tone(988,0.05,'square',0.06);tone(1319,0.08,'square',0.06,null,0.05);},
+ freeze:()=>{tone(1500,0.15,'sine',0.08,700);tone(2200,0.2,'sine',0.05,1200);},
+ whoosh:()=>noise(0.35,0.18,900),
+ grab:()=>{tone(660,0.06,'sine',0.12);tone(990,0.09,'sine',0.1,null,0.06);},
+ wrap:()=>tone(520,0.08,'sine',0.08,880),
+ flip:()=>tone(700,0.04,'triangle',0.08,1000)
+};
+// VIBRATION. Inside the iPhone app (Capacitor with its Haptics plugin) this drives the phone's haptics; in a browser it uses
+// navigator.vibrate where one exists (iPhone browsers have none). ms picks the strength: up to 8 a light tap, up to 20 a medium
+// one, more a heavy one, 60+ the warning buzz. kind 'ok' is the success pattern (a wave clear). Light taps come at most every 70 ms.
+let HAP=null,hapT=0;
+function hapInit(){if(HAP!==null)return HAP;HAP=false;try{const Cp=window.Capacitor;if(Cp&&Cp.isNativePlatform&&Cp.isNativePlatform())HAP=(Cp.Plugins&&Cp.Plugins.Haptics)||(Cp.registerPlugin&&Cp.registerPlugin('Haptics'))||false;}catch(e){HAP=false;}return HAP;}
+function vib(ms,kind){if(!SET.vib||!ms)return;const now=(typeof performance!=='undefined'?performance.now():Date.now());if(kind!=='ok'&&ms<=20&&now-hapT<(ms<=8?70:45))return;hapT=now;const h=hapInit();
+ if(h){try{if(kind==='ok')h.notification({type:'SUCCESS'});else if(ms>=60)h.notification({type:'ERROR'});else h.impact({style:ms<=8?'LIGHT':ms<=20?'MEDIUM':'HEAVY'});}catch(e){}return;}
+ if(navigator.vibrate){try{navigator.vibrate(kind==='ok'?[20,60,20]:ms);}catch(e){}}}
+
+// ================= state =================
+let scr='title',scrT=0,R=null,paused=false,gateAnim=0,buffered=null,UI=[],labMsg='',labMsgT=0;
+const titleBall={x:180,y:200,vx:260,vy:-340,r:12,trail:[],nw:true};
+const P={down:false,id:null,ax:0,ay:0,x:0,y:0,hold:0,tier:'b',aim:false,heavy:true};
+// C: what the owned cards add up to (recalc)
+const C={keep:0.92,kick:150,keepH:HEAVY_KEEP,kickH:HEAVY_KICK,aimB:1,ballR:12,dmgB:0,kb:350,kbMul:1,spdMul:1,slowK:0.2,slowT:1.75,
+ heavy:0,split:0,split2:false,splitLife:1.2,fire:0,trailLife:0,blast:0,blastR:0,blastD:1,shieldMax:0,shieldRe:6,ghost:0,cham:0,snow:0,snowMax:0,
+ bouncy:0,shockN:0,bump:0,postZap:false,wrap:0,kegs:0,kegD:2,kegR:70,kegChain:false,thorns:0,thornD:1,thornZap:false,ice:0};
+const fxOn=k=>{const f=R&&R.fx[k];return !!(f&&f.t>0);};
+const upL=k=>(R&&R.upg[k])||0;
+const snowR=n=>2.5*(n||0);
+// SNOWBALL: the growth lasts one flick. It melts back when the ball stops or the next flick starts (level 3 keeps half).
+function meltSnow(b){if(b.melted)return;b.melted=true;b.snow=C.snow>=3?Math.floor((b.snow||0)/2):0;b.r=C.ballR+snowR(b.snow);}
+
+// prac: null for a real run, or the practice setup {kind:'abilities'|'enemy'|'wave'|'boss', ...}
+function freshR(prac){
+ const mh=5+lv('hearts');R={sel:null,slowT:0,daily:null,hitBank:false,bankPopF:-1,t:0,gt:0,acc:0,ts:1,wave:0,waveN:0,wv:null,waveT:0,kills:0,score:0,hearts:mh,maxH:mh,upg:{},reroll:1,banishes:0,locks:0,banned:[],locked:null,lockedShown:null,gateMode:null,heat:META.heat,xpGain:0,newHeat:false,level:1,nextLvl:800,lvlDue:0,freeDue:0,picksOwed:0,pickN:0,gateLvl:0,rewards:[],gateKind:'wave',bestChain:0,totalKills:0,lost:0,flicks:0,heavyN:0,fullN:0,practice:prac||null,picks:0,
+  plan:[],si:-1,bossesBeaten:0,clearTitle:'',clearName:'',met:null,first:false,hintT:0,trickFree:false,
+  enemies:[],pending:[],chunks:[],parts:[],pops:[],minis:[],rings:[],stomps:[],bumpers:[],fires:[],kegs:[],kegT:0,
+  pickups:[],pu:{},fx:{},tilt:null,twin:{n:0,b:null},holes:[],ice:[],bolts:[],dq:[],puSeen:false,grabs:0,
+  shots:[],marks:[],slime:[],patches:[],booms:[],mags:[],trick:null,forceEc:null,flipDone:false,total:0,room:null,guest:null,inBoss:false,
+  ball:{x:180,y:250,vx:0,vy:0,r:12,hot:false,hotT:0,chain:0,last:null,split:false,commit:0,inv:0,trail:[],punch:0,chainPop:0,heavy:false,hits:new Set(),coldT:9,fireT:0,col:'g',flips:0,white:false,bounces:0,wallRun:0,shield:0,shieldT:0,snow:0,melted:true,passed:new Set(),iceSeen:new Set(),blasted:false,shocks:0,thru:false,wrapped:false,leech:null},
+  spawnT:0,orderI:0,doorI:0,boss:null,wflash:[0,0,0,0],shake:{t:0,mag:0,dx:0,dy:0},freeze:0,flash:0,
+  intro:0.5,blocks:[],squads:[],phase:'wave',endT:0,gateT:-1,gateN:0,offer:[],doorGlow:[0,0,0,0,0,0],clearTime:0,rank:'',nb:{}};
+ if(prac)for(const k in LAB)if(CARDS[k]&&LAB[k]>0)R.upg[k]=clamp(LAB[k]|0,1,3);}
+// opt.daily: today's daily run
+function newRun(prac,opt){
+ rnd=Math.random;freshR(prac);
+ if(!prac&&opt&&opt.daily){const day=todayKey();R.daily={day,seed:hashStr('banked-daily-'+day)};rs=R.daily.seed;rnd=seeded;R.heat=1;R.hearts=R.maxH=5;}
+ R.first=!prac&&!R.daily&&!META.tut;R.plan=prac?practicePlan(prac):R.daily?dailyPlan():buildPlan(false);
+ recalc();R.ball.shield=C.shieldMax;buffered=null;paused=false;
+ saveRun('wave');advance();R.spawnT=1.6;
+ if(prac){const on=COMBOS.filter(c=>hasCombo(c.name));if(on.length)pop('COMBO: '+on.map(c=>c.name).join(' + '),180,330,'#ffd23f',on.length>2?13:18,2.4);}}
+function recalc(){const u=R.upg,L=k=>u[k]||0;
+ C.aimB=1+lvR('aim');C.spdMul=1+0.06*lvR('speed');const SL=[[0.2,1.75],[0.15,2.25],[0.11,2.75],[0.08,3.5]][lvR('slow')];C.slowK=SL[0];C.slowT=SL[1];C.kb=350;
+ const hv=L('Heavy');C.heavy=hv;C.ballR=12+lvR('size')+[0,3,5,5][hv];C.dmgB=hv?1:0;C.kbMul=[1,2,2.5,2.5][hv];
+ const sp=L('Splitter');C.split=[0,2,3,3][sp];C.split2=sp>=3;C.splitLife=1.2;
+ const fb=L('Fireball');C.fire=fb;C.trailLife=[0,0.8,1.2,1.6][fb];
+ const bl=L('Blast');C.blast=bl;C.blastR=[0,60,80,80][bl];C.blastD=1;
+ const sh=L('Shield');C.shieldMax=sh>=3?2:sh?1:0;C.shieldRe=sh>=2?6:8;
+ C.ghost=L('Ghost');C.cham=L('Chameleon');const sn=L('Snowball');C.snow=sn;C.snowMax=[0,2,3,4][sn];
+ const bo=L('Bouncy');C.bouncy=bo;C.shockN=bo>=3?1:0;C.keep=[0.92,0.98,1,1][bo];C.kick=[150,210,250,250][bo];C.keepH=[HEAVY_KEEP,1,1,1][bo];C.kickH=[HEAVY_KICK,90,120,120][bo];
+ const po=L('Posts');C.bump=[0,2,3,3][po];C.postZap=po>=3;
+ C.wrap=L('Wrap');
+ const kg=L('Kegs');C.kegs=[0,2,3,3][kg];C.kegD=2;C.kegR=[70,70,85,85][kg];C.kegChain=kg>=3;
+ const th=L('Thorns');C.thorns=th;C.thornD=th>=2?2:1;C.thornZap=th>=3;
+ C.ice=L('Ice');
+ for(const k in u)if(famOf(k)==='POWER'&&!R.pu[k])R.pu[k]={t:3};
+ const b=R.ball;b.thru=C.ghost>=3;if(b.shield>C.shieldMax)b.shield=C.shieldMax;b.r=C.ballR+snowR(b.snow);b.x=clamp(b.x,b.r,W-b.r);b.y=clamp(b.y,b.r,AH-b.r);}
+// the game places terrain: posts on fixed spots, wrap holes in the walls, ice on the floor
+function placeTerrain(keepPosts){const old=R.bumpers;R.bumpers=BUMP_SPOTS.slice(0,C.bump).map(p=>({x:p[0],y:p[1],r:14,hitT:0,zapT:0}));if(keepPosts)for(let q=0;q<Math.min(old.length,R.bumpers.length);q++)R.bumpers[q]=old[q];
+ R.holes=[];if(C.wrap){const add=(s,a,b)=>R.holes.push({s,a,b});add(0,404,464);add(1,404,464);if(C.wrap>=2){add(0,58,112);add(1,58,112);}if(C.wrap>=3){add(2,150,210);add(3,150,210);}}
+ R.ice=[];if(C.ice){const n=C.ice>=2?3:2,r=C.ice>=2?50:44;for(let i=0;i<n;i++)R.ice.push({x:ICE_SPOTS[i][0],y:ICE_SPOTS[i][1],r,i});}
+ const b=R.ball;for(const bu of R.bumpers){const dx=b.x-bu.x,dy=b.y-bu.y,d=Math.hypot(dx,dy),rr=b.r+bu.r+2;if(d<rr){const nx=d>0.01?dx/d:0,ny=d>0.01?dy/d:1;b.x=bu.x+nx*rr;b.y=bu.y+ny*rr;}}
+ R.kegT=Math.min(R.kegT,0.6);}
+// remaining enemies of each colour: still queued, walking in, or alive (grey and two-tone counted on their own)
+function leftByCol(){const r={g:0,y:0,b:0,x:0,t:0};const add=c=>{if(R.forceEc&&(c==='g'||c==='b'))c=R.forceEc;if(r[c]!=null)r[c]++;};
+ const tok=t=>{if(t.type==='pair'){add('g');add('b');}else if(!ETYPES[t.type]||!ETYPES[t.type].noCount)add(t.ec);};
+ for(const q of R.squads)for(const t of q.toks)tok(t);for(const p of R.pending)tok(p.tok);
+ for(const e of R.enemies)if(!e.dead&&!e.boss&&!ETYPES[e.type].noCount&&r[e.ec]!=null)r[e.ec]++;return r;}
+// a new wave or the boss: clear the floor and start every power-up timer again
+function clearField(){R.chunks.length=0;R.enemies.length=0;R.pending.length=0;R.minis.length=0;R.pickups.length=0;R.dq.length=0;R.bolts.length=0;R.kegs.length=0;R.fx={};R.tilt=null;R.twin.b=null;R.ball.hits.clear();
+ R.shots.length=0;R.marks.length=0;R.slime.length=0;R.patches.length=0;R.booms.length=0;R.stomps.length=0;R.mags=[];R.ball.leech=null;
+ let i=0;for(const k in R.pu){R.pu[k].t=2.5+1.5*i;i++;}}
+
+// ================= saving a run =================
+// A run is saved at every card screen (kind 'gate') and at the start of every wave and the boss (kind 'wave'). If the app is
+// closed, CONTINUE on the title brings back the card screen, or starts the interrupted wave again. QUIT keeps the save too.
+// Practice runs are never saved. The save goes when the run ends.
+const RUN_KEYS=['gt','wave','waveN','score','hearts','maxH','upg','reroll','banishes','locks','banned','locked','lockedShown','heat','level','nextLvl','lvlDue','freeDue',
+ 'picksOwed','pickN','gateLvl','rewards','bestChain','totalKills','lost','flicks','heavyN','fullN','picks','plan','si','bossesBeaten','clearTitle','met','first','pu','puSeen','grabs','offer','gateN','daily'];
+function saveRun(kind){if(!R||R.practice)return;const o={v:1,kind,rs,twinN:R.twin.n};for(const k of RUN_KEYS)o[k]=R[k];SAVED=JSON.parse(JSON.stringify(o));try{localStorage.setItem('banked9.run',JSON.stringify(o));}catch(e){}}
+function keepHurt(){if(!R||R.practice||!SAVED||SAVED.kind!=='wave'||R.hearts>=SAVED.hearts||R.hearts<1)return;SAVED.hearts=R.hearts;try{localStorage.setItem('banked9.run',JSON.stringify(SAVED));}catch(e){}}
+function clearRun(){SAVED=null;try{localStorage.removeItem('banked9.run');}catch(e){}}
+function runOk(o){if(!o||o.v!==1||!Array.isArray(o.plan)||typeof o.si!=='number'||o.si>=o.plan.length-(o.kind==='gate'?1:0)||(o.hearts|0)<1)return false;
+ return o.plan.every(s=>s&&(s.k==='boss'?!!BOSSES[s.key]:(WAVES.some(w=>w.k===s.w)||!!(s.intro&&ETYPES[s.intro]))));}
+function continueRun(){const o=SAVED;if(!o||!runOk(o)){clearRun();return;}audioInit();freshR(null);for(const k of RUN_KEYS)if(k in o)R[k]=o[k];R.twin.n=o.twinN|0;
+ if(R.daily){rs=o.rs|0;rnd=seeded;}else rnd=Math.random;recalc();R.ball.shield=C.shieldMax;buffered=null;paused=false;R.sel=null;
+ if(o.kind==='gate'){R.phase='gatewait';R.wv=null;scr='gate';scrT=0;gateAnim=0;if(!R.offer||!R.offer.length)R.offer=makeOffer([]);}
+ else{scr='play';scrT=0;advance();R.spawnT=1.6;}}
+// what the title says about a saved run: what comes next, and your hearts
+function savedLabel(o){const n=o.si+1,s=o.plan[n],nw=o.plan.filter(q=>q.k==='wave').length;
+ const w=!s?'':s.k==='boss'?'the boss':'wave '+o.plan.slice(0,n+1).filter(q=>q.k==='wave').length+' of '+nw;
+ return (o.daily?'Daily run':'Saved run')+': '+(o.kind==='gate'?'cards, then ':'')+w+'  ·  ♥ '+o.hearts+'/'+o.maxH;}
+
+// ================= run plan =================
+// a run is 4 waves and a boss. The very first run is fixed: runners (full pull), tanks (short pull), Pairs, Lanes, then the Twin Kings.
+// After that: an opening wave, the next new kind's intro wave (while any are left), two later waves (the last with Big enemies), and a boss.
+const nextNew=()=>NEW_ORDER.find(k=>!META.seen.includes(k))||null;
+const metKind=k=>k==='runner'||k==='tank'||META.seen.includes(k);
+// a wave can come up once you have met the kind it needs
+const waveOk=w=>!w.need||metKind(w.need);
+const pickBoss=()=>pickR(BOSS_KEYS.filter(k=>k!==META.lastBoss));
+function buildPlan(prac){
+ if(!prac&&!META.tut)return [{k:'wave',w:'first1'},{k:'wave',w:'first2'},{k:'wave',w:'pairs'},{k:'wave',w:'lanes'},{k:'boss',key:'kings'}];
+ const nk=prac||!META.newOk?null:nextNew(),introW=nk==='nest'?'hives':null;
+ const t1=shuffleR(WAVES.filter(w=>w.tier===1&&waveOk(w))),t2=shuffleR(WAVES.filter(w=>w.tier===2&&waveOk(w)&&w.k!==introW));
+ const plan=[{k:'wave',w:t1[0].k},nk?{k:'wave',w:introW,intro:nk}:{k:'wave',w:t1[1].k},{k:'wave',w:t2[0].k},{k:'wave',w:t2[1].k,big:true},{k:'boss',key:pickBoss()}];
+ // GOLDEN: in about 4 runs of 10, one enemy in wave 3 or 4 is a runaway worth an extra pick
+ if(rnd()<0.4)plan[rnd()<0.5?2:3].gold=true;
+ return plan;}
+// DAILY RUN: two early waves, two later waves (the last with Big enemies) and a boss, from every wave and enemy in the game.
+// The same for everyone that day (seeded), at normal heat, with no new-enemy intro.
+function dailyPlan(){const t1=shuffleR(WAVES.filter(w=>w.tier===1)),t2=shuffleR(WAVES.filter(w=>w.tier===2));
+ const plan=[{k:'wave',w:t1[0].k},{k:'wave',w:t1[1].k},{k:'wave',w:t2[0].k},{k:'wave',w:t2[1].k,big:true},{k:'boss',key:pickR(BOSS_KEYS)}];
+ if(rnd()<0.5)plan[rnd()<0.5?2:3].gold=true;return plan;}
+// practice: one room on a loop, one boss, or a run with the chosen abilities
+function practicePlan(p){
+ if(p.kind==='enemy')return [{k:'wave',fixed:testWave(p),loop:true,guest:p.enemy}];
+ if(p.kind==='wave'){const w=WAVES.find(w=>w.k===p.wave)||WAVES[2];return [{k:'wave',fixed:w,loop:true}];}
+ if(p.kind==='boss')return [{k:'boss',key:p.boss}];
+ return buildPlan(true);}
+// a test room for one enemy kind: three squads of it (with the chosen twist and colour), plus tanks for the medic to heal
+function testWave(p){const T=ETYPES[p.enemy]||ETYPES.runner,tw=p.twist?'+'+p.twist:'',col=p.col==='blue'?':b':p.col==='green'?':g':'';
+ const n={swarm:6,nest:2,medic:2}[p.enemy]||3;
+ const tok=i=>p.enemy+(T.ec==='e'?(col||(i%2?':b':':g')):'')+tw,sq=k=>Array.from({length:k},(_,i)=>tok(i)).join(' ');
+ const extra=p.enemy==='medic'?' tank*3':'';
+ if(p.enemy==='nest')return {k:'test',name:T.name,tier:1,rule:T.rule,desc:T.d,place:[{t:p.enemy,x:70,y:70,el:p.twist},{t:p.enemy,x:290,y:70,el:p.twist}],script:[{d:[2,3],c:'runner*3'},{d:[4,5],c:'runner tank runner'}]};
+ return {k:'test',name:T.name,tier:1,rule:T.rule,desc:T.d,script:[{d:[0,1],c:sq(n)+extra},{d:[2,3],c:sq(n)},{d:[4,5],c:sq(n)+extra}]};}
+// a new kind's intro wave, built from its INTRO line: three squads from three pairs of doors; either-colour kinds alternate green and blue
+function introWave(k){const T=ETYPES[k],sqs=(INTRO[k]||k+'*3').split('|'),drs=[[0,1],[2,3],[4,5]];
+ const col=c=>c.split(' ').map((t,i)=>{const m=t.match(/^(\w+)(\*(\d+))?$/);if(!m||m[1]!==k||T.ec!=='e')return t;const n=+(m[3]||1);return Array.from({length:n},(_,j)=>k+((i+j)%2?':b':':g')).join(' ');}).join(' ');
+ return {k:'intro',name:'NEW: '+T.name,tier:1,rule:T.rule,desc:T.d,script:sqs.map((c,i)=>({d:drs[i%3],c:col(c)}))};}
+// the wave's guest ('?'): one kind you have already met (not a nest, not one the wave rules out); before you have met any, a runner
+function pickGuest(w){const ok=(R&&R.daily?NEW_ORDER:META.seen).filter(k=>k!=='nest'&&!(w&&w.noGuest&&w.noGuest.includes(k)));return ok.length?pickR(ok):'runner';}
+const totalWaves=()=>R.plan.filter(s=>s.k==='wave').length;
+const loopRoom=()=>!!(R.practice&&R.plan[R.si]&&R.plan[R.si].loop);
+// a plan stage becomes a room: its wave, its guest, and whether it has Big or Golden enemies
+function roomFor(s){const w=s.fixed||(s.w?WAVES.find(q=>q.k===s.w):introWave(s.intro));
+ return {w,guest:s.guest||pickGuest(w),big:!!s.big||(!R.practice&&R.heat>=5),gold:!!s.gold,intro:s.intro||null};}
+// the wave a plan stage will be, for the screen before it
+const stageWave=s=>s.fixed||(s.w?WAVES.find(q=>q.k===s.w):introWave(s.intro));
+// go to the next stage: a wave or the boss. After the last stage the run ends.
+function advance(){
+ if(loopRoom()){enterRoom(roomFor(R.plan[R.si]));return;}
+ R.si++;
+ if(R.si>=R.plan.length){finishRun();return;}
+ const s=R.plan[R.si];reseed(100+R.si);
+ if(s.k==='boss'){scr='play';scrT=0;startBoss(s.key);return;}
+ enterRoom(roomFor(s));}
+function enterRoom(o){scr='play';scrT=0;startWave(o);}
+
+// ================= waves =================
+function mkTok(type,ec,el){const T=ETYPES[type]||ETYPES.runner;let c=T.ec;if(c==='e')c=ec==='g'||ec==='b'?ec:(rnd()<0.5?'g':'b');return {type,ec:c,el:el||''};}
+function parseToks(s){const out=[];for(const raw of s.split(' ')){if(!raw)continue;let t=raw,n=1,el='',ec='';const m=t.match(/\*(\d+)$/);if(m){n=+m[1];t=t.slice(0,m.index);}
+  const pi=t.indexOf('+');if(pi>=0){el=t.slice(pi+1);t=t.slice(0,pi);}const ci=t.indexOf(':');if(ci>=0){ec=t.slice(ci+1);t=t.slice(0,ci);}
+  for(let i=0;i<n;i++){if(t==='pair'){out.push({type:'pair',ec:'g',el:''});continue;}out.push(mkTok(t==='?'?R.guest:t,ec,el));}}
+ return out;}
+// BIG rooms (the last wave, and every wave at heat 5): one plain enemy in each squad is Big
+function makeSquad(q,o){const toks=parseToks(q.c||'');
+ if(o.big){const plain=toks.filter(t=>!t.el&&t.type!=='pair');if(plain.length)plain[Math.floor(rnd()*plain.length)].el='Big';}
+ return {d:(q.d||[0]).slice(),toks,ring:q.ring||0,low:q.low,gap:q.gap,pop:q.pop};}
+function startWave(o){const w=o.w;R.waveN++;R.wave=R.waveN;R.wv=w;R.room=o;R.guest=o.guest||'runner';R.waveT=0;R.kills=0;R.spawnT=0.8;R.orderI=0;R.doorI=0;R.phase='wave';R.boss=null;R.inBoss=false;R.trickFree=false;
+ clearField();
+ R.forceEc=w.flip?'g':null;R.flipDone=false;
+ R.blocks=(w.blocks||[]).map(k=>Object.assign({},k,k.mv?{mv:Object.assign({},k.mv)}:{}));
+ R.squads=(w.script||[]).map(q=>makeSquad(q,o));
+ // GOLDEN: one plain enemy in a later squad
+ if(o.gold){const later=R.squads.slice(1).filter(q=>q.toks.some(t=>!t.el&&t.type!=='pair'));if(later.length){const q=pickR(later);pickR(q.toks.filter(t=>!t.el&&t.type!=='pair')).el='Golden';}}
+ R.trick=w.trick?{round:0,flick:-1,k0:0,n:0,perfect:0,free:false}:null;
+ placeTerrain(false);
+ for(const p of w.place||[]){const e=spawnAt(p.t,p.x,p.y,null,{hold:p.hold,el:p.el||''});e.placed=true;}
+ if(R.trick)trickRound();
+ R.total=R.enemies.filter(e=>!ETYPES[e.type].noCount).length;for(const q of R.squads)for(const t of q.toks)R.total+=t.type==='pair'?2:1;
+ // a new kind's intro wave marks it as met
+ if(o.intro&&!R.practice&&!META.seen.includes(o.intro)){META.seen.push(o.intro);R.met=o.intro;META.newOk=false;save();}
+ // the wave's name, briefly, near the top. Its rule stays in the HUD for the whole wave.
+ pop((w.k==='test'||loopRoom()?'':'WAVE '+R.waveN+' · ')+w.name,180,64,o.intro?'#ffd23f':'#fff',18,1.8);
+ if(R.waveN===1&&R.heat>1)pop('HEAT '+R.heat+': '+HEAT_RULES[R.heat-1],180,90,'#ff8a5c',12,2.4);}
+// waves end when everything that counts is dead; HIVES when the three nests break
+function waveDone(){const w=R.wv;if(!w)return false;
+ if(w.hives)return !R.enemies.some(e=>!e.dead&&e.type==='nest')&&!R.pending.some(p=>p.tok.type==='nest');
+ if(R.trick&&R.trick.round<3)return false;
+ return !R.squads.length&&!R.pending.length&&!R.enemies.some(e=>!e.dead&&!ETYPES[e.type].noCount);}
+// COLOUR FLIP: once half the wave is dead, everything green (alive or still to come) turns blue
+function doFlip(){R.flipDone=true;R.forceEc='b';for(const e of R.enemies)if(!e.dead&&e.ec==='g'){e.ec='b';R.rings.push({x:e.x,y:e.y,r:e.r+10,t:0,life:0.3,col:colOf('b')});}
+ pop('COLOUR FLIP: EVERYTHING IS BLUE',180,200,colOf('b'),16,1.6);sfx.bell(true);shake(4,0,0);}
+// TRICK SHOT: five green targets stand on the path of one bank shot off a side wall, from wherever the ball is now
+function trickPath(){const b=R.ball;
+ for(let n=0;n<300;n++){const side=rnd()<0.5?0:1,wx=side===0?b.r:W-b.r,ty=40+rnd()*(AH-80),dx=wx-b.x,dy=ty-b.y,L=Math.hypot(dx,dy);if(Math.abs(dx)<70||L>420)continue;
+  const ux=-dx/L,uy=dy/L,pts=[];let ok=true;
+  for(let i=0;i<5;i++){const t=60+i*48,x=wx+ux*t,y=ty+uy*t;if(x<28||x>W-28||y<28||y>AH-28||Math.hypot(x-b.x,y-b.y)<60){ok=false;break;}pts.push({x,y});}
+  if(ok)return pts;}
+ return null;}
+function trickRound(){const tr=R.trick;tr.round++;const pts=trickPath();if(!pts){tr.round=3;return;}
+ for(const p of pts){const e=spawnAt('runner',p.x,p.y,null,{ec:'g'});e.target=true;e.placed=true;}
+ tr.flick=-1;pop('TRICK SHOT '+tr.round+'/3: ALL 5 IN ONE FLICK',180,AH-90,'#ffd23f',13,2.6);}
+// once the flick that started on the targets is over: all five down is a TRICK SHOT (+300, and the first one in a wave earns an extra pick). Survivors wake up.
+function trickStep(){const tr=R.trick,b=R.ball;
+ if(tr.flick>=0&&!b.hot&&b.commit<=0&&!R.minis.length){const left=R.enemies.filter(e=>e.target&&!e.dead).length;
+  if(left===0&&R.kills-tr.k0>=tr.n){tr.perfect++;R.score+=300;pop('TRICK SHOT! +300',180,200,'#ffd23f',26,1.4);sfx.bell(true);if(!tr.free){tr.free=true;R.freeDue++;R.rewards.push('TRICK SHOT');pop('+1 PICK AFTER THE WAVE',180,228,'#ffd23f',14,1.6);}}
+  else if(left>0)pop('MISSED '+left+': NOW THEY MOVE',180,220,'#ff8a5c',14,1.0);
+  for(const e of R.enemies)e.target=false;tr.flick=-2;}
+ if(tr.round<3&&!R.enemies.some(e=>!e.dead)&&!R.pending.length)trickRound();}
+
+// ================= bosses =================
+// every boss is made of enemy parts (so blasts, fire, lightning and paint all work on them), plus THE WALL, which is a moving block
+function bpart(type,x,y,o){const e=spawnAt(type,x,y,null,o);e.boss=R.boss;e.placed=true;R.boss.parts.push(e);return e;}
+const BOSS_INIT={
+ kings:(bs,hb)=>{for(const [x,c] of [[110,'b'],[250,'g']]){const e=bpart('king',x,90,{ec:c});e.hp=e.maxHp=16+4*hb;e.s={};}bs.rev=null;},
+ wall:(bs,hb)=>{const k={x:65,y:-40,w:230,h:34,boss:true};R.blocks.push(k);bs.wall=k;bs.hp=bs.maxHp=20+5*hb;bs.col='g';bs.colT=6;bs.st='down';bs.hitT=0;bs.armorT=0;},
+ knight:(bs,hb)=>{const e=bpart('knight',180,130,{ec:'g'});e.hp=e.maxHp=12+3*hb;e.s={dash:null,dizzy:0,copy:null};},
+ jugg:(bs,hb)=>{const e=bpart('jugg',180,100,{ec:'b'});e.hp=e.maxHp=20+5*hb;e.s={st:'aim',t:2,dx:0,dy:1,n:0,sx:0,sy:0,bounced:false};}
+};
+function startBoss(key){if(!BOSSES[key])key='kings';R.phase='boss';R.inBoss=true;R.wv=null;R.room=null;R.blocks=[];R.squads=[];R.waveT=0;R.forceEc=null;R.trick=null;clearField();placeTerrain(false);
+ const B=BOSSES[key];R.boss={key,name:B.name,t:0,phase:1,active:false,parts:[],enraged:false};
+ BOSS_INIT[key](R.boss,R.heat-1);for(const p of R.boss.parts)p.shell=true;
+ R.bossMax=R.boss.wall?R.boss.maxHp:R.boss.parts.reduce((a,p)=>a+p.maxHp,0);
+ pop(B.name,180,96,'#ff8fb8',26,1.6);sfx.roar();shake(6,0,1);}
+// how much boss is left, 0 to 1 (the Twin Kings count both kings, dead or alive)
+function bossFrac(){const bs=R.boss;if(!bs)return 0;if(bs.wall)return clamp(bs.hp/bs.maxHp,0,1);let h=0;for(const p of bs.parts)if(!p.dead)h+=Math.max(0,p.hp);return clamp(h/(R.bossMax||1),0,1);}
+function bossPartDied(e){const bs=e.boss;if(!bs||R.phase!=='boss')return;
+ if(bs.key==='kings'){const other=bs.parts.find(p=>p!==e&&!p.dead);if(other){bs.rev={x:e.x,y:e.y,ec:e.ec,maxHp:e.maxHp,t:8};if(bs.phase===1){bs.phase=2;pop(PHASE2.kings,180,96,'#ff6b6b',18,1.4);sfx.roar();}}else bs.rev=null;}
+ if(!bs.parts.some(p=>!p.dead))bossDie();}
+function bossDie(){const bs=R.boss;if(R.phase!=='boss')return;R.phase='bossdead';R.endT=1.5;buffered=null;R.clearTime=R.gt;R.bossesBeaten++;
+ const k=bs.wall,c=k?{x:k.x+k.w/2,y:k.y+k.h/2}:(bs.parts[bs.parts.length-1]||{x:180,y:150});
+ burst(c.x,c.y,'#c0507a',40);burst(c.x,c.y,'#d9dfe8',12);shake(9,0,1);R.freeze=Math.max(R.freeze,0.1);sfx.boom();sfx.roar();
+ for(const e of R.enemies)if(!e.dead)burst(e.x,e.y,colOf(e.ec),6);R.enemies.length=0;R.pending.length=0;R.stomps.length=0;R.pickups.length=0;R.shots.length=0;R.marks.length=0;R.patches.length=0;R.ball.leech=null;
+ if(k)R.blocks=R.blocks.filter(q=>q!==k);
+ R.score+=500;R.clearName=bs.name;R.clearTitle=bs.name+' DOWN';pop(R.clearTitle,180,220,'#7dffa0',26,1.5);}
+// the boss is the end of the run
+function afterBoss(){finishRun();}
+
+// ================= physics (shared by ball, minis and the aim line) =================
+function holeAt(s,p){for(const h of R.holes)if(h.s===s&&p>=h.a&&p<=h.b)return h;return null;}
+function onIce(x,y){for(const i of R.ice){const dx=x-i.x,dy=y-i.y;if(dx*dx+dy*dy<i.r*i.r)return i;}return null;}
+// walls, wrap holes and blocks. In a wrap hole the ball goes through the wall and comes out the other side (b.wrapped this step).
+function wallStep(b,dt,keep,kick,cb){
+ b.x+=b.vx*dt;b.y+=b.vy*dt;let hit=-1;b.wrapped=false;const hs=!b.nw&&R&&R.holes.length>0;
+ if(b.x-b.r<0){if(hs&&holeAt(0,b.y)){if(b.x<0){b.x+=W;b.wrapped=true;}}else{b.x=b.r;b.vx=Math.abs(b.vx);hit=0;}}
+ else if(b.x+b.r>W){if(hs&&holeAt(1,b.y)){if(b.x>W){b.x-=W;b.wrapped=true;}}else{b.x=W-b.r;b.vx=-Math.abs(b.vx);hit=1;}}
+ if(b.y-b.r<0){if(hs&&holeAt(2,b.x)){if(b.y<0){b.y+=AH;b.wrapped=true;}}else{b.y=b.r;b.vy=Math.abs(b.vy);hit=hit<0?2:hit;}}
+ else if(b.y+b.r>AH){if(hs&&holeAt(3,b.x)){if(b.y>AH){b.y-=AH;b.wrapped=true;}}else{b.y=AH-b.r;b.vy=-Math.abs(b.vy);hit=hit<0?3:hit;}}
+ if(!b.nw&&R&&R.blocks)for(const k of R.blocks){if(b.thru&&!k.boss)continue;const cx=clamp(b.x,k.x,k.x+k.w),cy=clamp(b.y,k.y,k.y+k.h);let dx=b.x-cx,dy=b.y-cy,d=Math.hypot(dx,dy);if(d>=b.r)continue;if(d<0.001){dx=0;dy=b.vy>0?-1:1;d=1;}
+  const nx=dx/d,ny=dy/d;b.x=cx+nx*b.r;b.y=cy+ny*b.r;const dot=b.vx*nx+b.vy*ny;if(dot<0){b.vx-=2*dot*nx;b.vy-=2*dot*ny;if(hit<0){hit=4;b.blk=k;b.bnx=nx;b.bny=ny;}}}
+ if(hit>=0){const s=Math.hypot(b.vx,b.vy);if(s>0){const ns=Math.min(1200,s*keep+kick);b.vx*=ns/s;b.vy*=ns/s;}if(cb)cb(hit,b);}
+}
+// push b out of circle (cx,cy,cr); reflect if moving inward. returns true on reflect
+function circleBounce(b,cx,cy,cr,keep,kick,toSpeed){const dx=b.x-cx,dy=b.y-cy,d=Math.hypot(dx,dy),rr=b.r+cr;if(d>=rr)return false;
+ const nx=d>0?dx/d:1,ny=d>0?dy/d:0;const dot=b.vx*nx+b.vy*ny;b.x=cx+nx*rr;b.y=cy+ny*rr;if(dot>=0)return false;
+ b.vx-=2*dot*nx;b.vy-=2*dot*ny;const s=Math.hypot(b.vx,b.vy);if(s>0){const ns=toSpeed?toSpeed:Math.min(1200,s*keep+kick);b.vx*=ns/s;b.vy*=ns/s;}return true;}
+// a post resets the ball to full speed; once the ball has been hot for over 2 s in one flick the reset fades so no build loops forever.
+// A blue (heavy) ball treats posts like walls: no reset to full speed.
+function bumperStep(b,bumpers,cb){const h=b.hotT||0;const full=h>2?Math.max(300,1200-900*(h-2)):1200;for(const bu of bumpers){if(circleBounce(b,bu.x,bu.y,bu.r,b.heavy?C.keepH:1,0,b.heavy?0:full)&&cb)cb(bu,b);}}
+// wall keep / kick for this ball: blue keeps 98% plus a small kick (more with BOUNCY WALLS)
+const keepOf=b=>b.heavy?C.keepH:C.keep,kickOf=b=>b.heavy?C.kickH:C.kick;
+// SLIMER trails make the ball slow down three times as fast
+function decelOf(b){const x=b.hotT>2?600*(b.hotT-2):0;let d=(R&&R.ice.length&&!b.nw&&onIce(b.x,b.y))?ICE_DECEL:(b.heavy?HEAVY_DECEL:DECEL);if(R&&R.slime.length&&!b.nw&&onSlime(b.x,b.y))d*=3;return d+x;}
+// the one motion step shared by the ball, the twin, the aim line and the commit-window ghost: slowStep (speed, stop under 40, hot flag) then bounceMove (walls, posts)
+// MAGNET: bends a moving ball toward it without changing its speed (the aim line runs this too, so it shows the curve)
+function slowStep(b,dt){let s=Math.hypot(b.vx,b.vy);if(s>0&&R&&R.mags&&R.mags.length&&!b.nw){for(const m of R.mags){const dx=m.x-b.x,dy=m.y-b.y,d2=dx*dx+dy*dy;if(d2>220*220||d2<1)continue;const d=Math.sqrt(d2),a=9e6/(d2+3000)*dt;b.vx+=dx/d*a;b.vy+=dy/d*a;}const s2=Math.hypot(b.vx,b.vy)||1;b.vx*=s/s2;b.vy*=s/s2;}if(s>0){const ns=Math.max(0,s-decelOf(b)*dt);if(ns<40){b.vx=0;b.vy=0;s=0;}else{b.vx*=ns/s;b.vy*=ns/s;s=ns;}}
+ b.hot=s>=(b.heavy?HEAVY_HOTV:HOTV);if(b.hot)b.hotT+=dt;else b.hotT=0;return s;}
+function bounceMove(b,dt,bumpers,onW,onB){wallStep(b,dt,keepOf(b),kickOf(b),onW);bumperStep(b,bumpers,onB);}
+function moveStep(b,dt,bumpers,onW,onB){const s=slowStep(b,dt);if(s>0)bounceMove(b,dt,bumpers,onW,onB);return s;}
+// the aim line runs the same steps as the real ball, so ice, posts, bouncy walls and wrap holes all show up in it.
+// If the ball goes cold before bounce (bounces+1), cold={x,y} is where (pts[coldI]), the sim rolls on to the real stop and stop={x,y} is where it ends;
+// otherwise cold=null and the line is 'bounces' + a 60-unit stub. evs lists every bounce ('wall','block','post') and wrap, for Chameleon colours.
+function simLine(x,y,vx,vy,r,bounces,bumpers,slow,heavy,thru){const b={x,y,vx,vy,r,hot:true,hotT:0,heavy:!!heavy,thru:!!thru};const pts=[{x,y}],dots=[],evs=[];let n=0,stub=0,stubbing=false,stubEnd=-1,over=false,cold=null,coldI=0,stop=null;
+ for(let i=0;i<900;i++){
+  if(slow&&!over){const s=slowStep(b,STEP);if(s===0){stop={x:b.x,y:b.y};break;}if(!cold&&!b.hot){cold={x:b.x,y:b.y};coldI=pts.length-1;}}
+  let bounced=false,kind='';bounceMove(b,STEP,bumpers,h=>{bounced=true;kind=h===4?'block':'wall';},()=>{bounced=true;kind='post';});
+  pts.push({x:b.x,y:b.y,w:b.wrapped});if(b.wrapped)evs.push({i:pts.length-1,k:'wrap'});if(bounced)evs.push({i:pts.length-1,k:kind});if(cold)continue;
+  if(stubbing&&stubEnd<0){stub+=Math.hypot(b.vx,b.vy)*STEP;if(stub>=60){stubEnd=pts.length;if(!slow||over)break;}}
+  if(bounced){dots.push({x:b.x,y:b.y,i:pts.length-1});n++;if(n>=bounces&&!stubbing){stubbing=true;stub=0;}if(slow&&n>=bounces+1){over=true;if(stubEnd>=0)break;}}}
+ if(slow&&!cold&&stubEnd>=0){pts.length=stubEnd;while(dots.length&&dots[dots.length-1].i>=stubEnd)dots.pop();while(evs.length&&evs[evs.length-1].i>=stubEnd)evs.pop();}
+ if(cold&&!stop)stop={x:b.x,y:b.y};
+ return {pts,dots,evs,end:pts[pts.length-1],cold,coldI,stop};}
+
+// ================= input =================
+// full-pull distance for this shot: min(PULL setting, free room from the anchor to the screen edge in the pull direction), never under 70
+function pullFull(ux,uy){const x0=-ox/sc,x1=(vw-ox)/sc,y0=-oy/sc,y1=(vh-oy)/sc;let t=1e9;
+ if(ux>1e-6)t=Math.min(t,(x1-P.ax)/ux);else if(ux<-1e-6)t=Math.min(t,(x0-P.ax)/ux);
+ if(uy>1e-6)t=Math.min(t,(y1-P.ay)/uy);else if(uy<-1e-6)t=Math.min(t,(y0-P.ay)/uy);
+ return Math.max(70,Math.min(SET.pull,t-2));}
+// the blue/green halfway point is a fixed finger distance (SET.pull/2) unless the screen edge is so close that green could not be reached
+function pullPower(){const dx=P.x-P.ax,dy=P.y-P.ay,L=Math.hypot(dx,dy);if(L<30)return null;const fc=pullFull(dx/L,dy/L),full=fc>=SET.pull*0.75?SET.pull:fc;return {L,ux:dx/L,uy:dy/L,pw:clamp((L-30)/(full-30),0,1)};}
+// BLUE (pw under TIER_B) is the soft shot: 500-740, heavy physics, stops after about 100-230. GREEN 1000-1200 (830-1200).
+function launchFromPull(){const s=pullPower();if(!s)return null;const pw=s.pw,tier=tierOf(pw),heavy=tier==='b';let spd;
+ if(heavy)spd=HEAVY_V0+(HEAVY_V1-HEAVY_V0)*(pw/TIER_B);
+ else spd=1000+200*((pw-TIER_Y)/(1-TIER_Y));
+ spd*=C.spdMul;if(R&&R.ball&&R.ball.leech)spd*=0.6;let dx=-s.ux,dy=-s.uy;if(SET.push){dx=-dx;dy=-dy;}return {vx:dx*spd,vy:dy*spd,pw,heavy,tier};}
+// the ball's colour right now: its launch colour, swapped by CHAMELEON. White (hits anything) under a RAINBOW STAR or after Chameleon's 3rd swap.
+function colourNow(b){if(b.white||(b===R.ball&&fxOn('Star')))return 'w';return b.flips%2?other(b.col):b.col;}
+// where a shot released now would really leave from: while launch is locked out (commit>0), run a copy of the ball through the same
+// moveStep for the rest of the lockout. A shot released in the lockout is queued (buffered) and fires from wherever the ball really is.
+function firePoint(){const b=R.ball;if(b.commit<=0)return {x:b.x,y:b.y,ghost:false};
+ const g={x:b.x,y:b.y,vx:b.vx,vy:b.vy,r:b.r,hot:b.hot,hotT:b.hotT,heavy:b.heavy,thru:b.thru};let c=b.commit;
+ while(c>0){c-=STEP;if(c<=0)break;moveStep(g,STEP,R.bumpers,null,null);}return {x:g.x,y:g.y,ghost:true};}
+function fire(v){const b=R.ball;b.vx=v.vx;b.vy=v.vy;b.heavy=!!v.heavy;b.col=v.tier||(v.heavy?'b':'g');b.white=false;b.flips=0;b.bounces=0;b.wallRun=0;b.hotT=0;b.hits.clear();b.passed.clear();b.iceSeen.clear();b.blasted=false;b.shocks=0;b.chain=0;b.last=null;b.split=false;b.fireT=0;b.commit=0.5;b.punch=0.04;R.flicks++;
+ meltSnow(b);b.melted=false;
+ if(b.col==='b')R.heavyN++;else R.fullN++;if(b.heavy)sfx.launchHeavy();else sfx.launch();vib(8);
+ if(R.twin.n>0){R.twin.n--;launchTwin(v);}
+ knightCopy(v);
+ if(R.trick&&R.trick.flick===-1&&R.enemies.some(e=>e.target&&!e.dead)){R.trick.flick=R.flicks;R.trick.k0=R.kills;R.trick.n=R.enemies.filter(e=>e.target&&!e.dead).length;}}
+function startRun(){audioInit();newRun(null);scr='play';scrT=0;}
+function startDaily(){audioInit();newRun(null,{daily:true});scr='play';scrT=0;}
+function startPractice(){audioInit();newRun(practiceSetup());if(scr!=='over'&&scr!=='clear')scr='play';scrT=0;}
+function practiceSetup(){const t=LABSEL.tab;if(t==='enemies')return {kind:'enemy',enemy:LABSEL.enemy,twist:LABSEL.twist,col:LABSEL.col};if(t==='waves')return {kind:'wave',wave:LABSEL.wave,hard:LABSEL.hard};if(t==='bosses')return {kind:'boss',boss:LABSEL.boss};return {kind:'abilities'};}
+function resetPointer(){P.down=false;P.id=null;P.aim=false;}
+function setPause(on){if(scr!=='play'||!R)return;paused=!!on;resetPointer();sfx.click(1);}
+function onDown(ev){if(ev.preventDefault)ev.preventDefault();audioInit();lastTouch=ev.pointerType==='touch'||ev.pointerType==='pen';const p=toL(ev);
+ if(scr==='play'&&uiTap(p))return;
+ if(P.down)return;P.down=true;P.id=ev.pointerId;P.x=p.x;P.y=p.y;P.aim=false;
+ if(scr==='title'){uiTap(p);return;}
+ if(scr==='shop'||scr==='settings'||scr==='lab'){uiTap(p);return;}
+ if(scr==='over'||scr==='clear'){if(scrT>END_GUARD)uiTap(p);return;}
+ if(scr==='gate'){if(scrT>=GATE_GUARD)uiTap(p);return;}
+ if(scr==='play'){if(paused||R.phase==='dead'||R.phase==='bossdead')return;P.ax=p.x;P.ay=p.y;P.hold=0;P.tier='b';P.heavy=true;P.aim=true;}}
+function onMove(ev){if(!P.down||ev.pointerId!==P.id)return;if(ev.preventDefault)ev.preventDefault();const p=toL(ev);P.x=p.x;P.y=p.y;
+ if(P.aim){const s=pullPower();const pw=s?s.pw:0;const tier=tierOf(pw);
+  if(tier!==P.tier){sfx.click(tier==='g'?3:1);vib(6);}P.tier=tier;P.heavy=tier==='b';}}
+// pointerup fires the shot if the pull is past the cancel zone (30); pointercancel always cancels
+function onUp(ev){if(!P.down||ev.pointerId!==P.id)return;if(ev.preventDefault)ev.preventDefault();P.down=false;P.id=null;
+ if(P.aim){P.aim=false;if(scr!=='play'||paused||R.phase==='dead'||R.phase==='bossdead')return;const v=launchFromPull();if(!v){sfx.cancel();buffered=null;return;}
+  if(R.ball.commit>0)buffered=v;else fire(v);}}
+function uiTap(p){for(const u of UI){if(p.x>=u.x&&p.x<=u.x+u.w&&p.y>=u.y&&p.y<=u.y+u.h){u.fn();return true;}}return false;}
+cv.addEventListener('pointerdown',onDown);
+window.addEventListener('pointermove',onMove);
+window.addEventListener('pointerup',onUp);
+window.addEventListener('pointercancel',ev=>{if(!P.down||ev.pointerId!==P.id)return;P.down=false;P.id=null;if(P.aim){P.aim=false;buffered=null;sfx.cancel();}});
+window.addEventListener('blur',resetPointer);
+document.addEventListener('visibilitychange',()=>{if(document.hidden){resetPointer();if(scr==='play'&&R){paused=true;keepHurt();}}});
+window.addEventListener('pagehide',()=>{if(scr==='play'&&R)keepHurt();});
+for(const t of ['touchstart','touchmove','touchend'])cv.addEventListener(t,e=>e.preventDefault(),{passive:false});
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+window.addEventListener('keydown',e=>{const k=(e.key||'').toLowerCase();lastTouch=false;
+ if(k==='r'){if(scr!=='title'&&scr!=='lab')startRun();}
+ else if(k==='p'||k==='escape'){if(scr==='play')setPause(!paused);}
+ else if(k===' '){if(scr==='play')setPause(!paused);else if(scr==='title')startRun();else if((scr==='over'||scr==='clear')&&scrT>END_GUARD)startRun();e.preventDefault();}
+ else if(k==='m'){SET.sound=!SET.sound;save();}
+ else if(scr==='gate'&&scrT>=GATE_GUARD){if(k==='1'||k==='2'||k==='3')pickCard(+k-1);else if(k==='4')patchUp();else if(k==='5')doReroll();else if(k==='6')setGateMode('banish');else if(k==='7')setGateMode('lock');}
+ else if(scr==='title'&&k==='enter')startRun();});
+
+// ================= fx helpers =================
+function pop(txt,x,y,col,size,life){R.pops.push({txt,x,y,col:col||'#fff',size:size||16,t:0,life:life||0.6});if(R.pops.length>12)R.pops.shift();}
+// a long message split over lines
+function popWrap(s,x,y,col,size,life){const ls=wrap(s,300,size);for(let i=0;i<ls.length;i++)pop(ls[i],x,y+i*(size+5),col,size,life);}
+// one hit pop, placed on the far side of the target (x,y,r) from the source (sx,sy); no source = above the target
+function farPop(t,x,y,r,sx,sy,col,size){let dx=x-(sx==null?x:sx),dy=y-(sy==null?y+1:sy);const d=Math.hypot(dx,dy);if(d<0.001){dx=0;dy=-1;}else{dx/=d;dy/=d;}pop(t,x+dx*(r+14),y+dy*(r+14),col,size,0.5);}
+function shake(mag,dx,dy){const s=R.shake;mag*=[0,0.35,1][SET.shake];if(!mag)return;if(mag>=s.mag*(s.t/0.2)){s.mag=mag;s.t=0.2;s.dx=dx||0;s.dy=dy||0;}}
+// death chunks: full colour for 0.6 s, then grey and fading, gone at 3 s; at most 40
+function burst(x,y,col,n){for(let i=0;i<n;i++){const a=Math.random()*TAU,s=100+Math.random()*150;R.chunks.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,r:3,col,t:0});}if(R.chunks.length>40)R.chunks.splice(0,R.chunks.length-40);}
+function part(x,y,vx,vy,col,r,life){R.parts.push({x,y,vx,vy,col,r,t:0,life});if(R.parts.length>160)R.parts.shift();}
+function sparks(x,y,side0){const side=side0>3?2:side0;for(let i=0;i<6;i++){const a=Math.random()*TAU;let vx=Math.cos(a)*180,vy=Math.sin(a)*180;if(side===0)vx=Math.abs(vx);if(side===1)vx=-Math.abs(vx);if(side===2)vy=Math.abs(vy);if(side===3)vy=-Math.abs(vy);part(x,y,vx,vy,'#ffe9a0',2,0.25);}}
+function puff(x,y){for(let i=0;i<7;i++){const a=Math.random()*TAU,s=30+Math.random()*60;part(x,y,Math.cos(a)*s,Math.sin(a)*s,'#9aa0b0',4+Math.random()*3,0.4);}}
+function chainBump(b){if(b!==R.ball)return;b.chainPop=0.15;if(b.chain>R.bestChain)R.bestChain=b.chain;if(b.chain===5)sfx.bell(false);if(b.chain===10)sfx.bell(true);}
+// a timed power-up effect (for the HUD bar and fxOn)
+function setFx(k,t,c){const f=R.fx[k];if(f&&f.t>0&&f.c===c){f.t+=t;f.max=f.t;}else R.fx[k]={t,max:t,c};}
+
+// ================= combat =================
+function tierDmg(chain){return chain>=6?3:chain>=3?2:1;}
+// TWO-TONE: the half facing (sx,sy) is green on the tA side, blue on the other
+function ecAt(e,sx,sy){if(e.ec!=='t')return e.ec;if(sx==null)return null;return Math.cos(Math.atan2(sy-e.y,sx-e.x)-e.tA)>=0?'g':'b';}
+// can a hit of colour c from (sx,sy) hurt e? It must match the enemy's colour (two-tone: the half it hits), or the paint on it.
+// Grey enemies take any colour. White hurts anything.
+function matches(c,e,sx,sy){if(c==='w')return true;if(e.paintT>0&&e.paint===c)return true;if(e.ec==='x')return !e.invuln;if(e.ec==='t'){const h=ecAt(e,sx,sy);return h?h===c:(c==='g'||c==='b');}return c===e.ec;}
+function popBubble(e){e.bubble=0;e.cd=Math.max(e.cd,0.15);R.rings.push({x:e.x,y:e.y,r:e.r+12,t:0,life:0.25,col:'#d9f2ff'});pop('POP',e.x,e.y-e.r-14,'#d9f2ff',13,0.4);sfx.pop();}
+// DAZE: a multi-hit enemy that survives a hit cannot walk, lunge or bite for a moment (tank 1.0 s). Fire does not daze. Bosses never daze.
+// A bubble soaks up the first hit; armour (shell) and the untouchable (mirror, underground, in the air) take nothing.
+function damageEnemy(e,dmg,src,sx,sy,col,size,by){if(e.dead)return;
+ if(e.bubble){popBubble(e);return;}
+ if(e.invuln||e.shell||e.under||e.air||(e.boss&&!e.boss.active)){e.armorT=0.12;e.hitT=0.06;return;}
+ if(fxOn('TimeStop')&&upL('TimeStop')>=3)dmg*=2;if(e.type==='charger'&&e.s.dizzy>0&&src==='ball')dmg+=1;
+ e.hp-=dmg;e.hitT=0.1;if(e.boss)R.score+=15*dmg*Math.max(1,(by||R.ball).chain||0)*(fxOn('Gold')?2:1);
+ if(e.hp>0&&e.maxHp>1&&src!=='fire'&&!e.boss){e.daze=Math.max(e.daze||0,e.maxHp>=3?1.0:0.8);e.lg=null;}
+ farPop(''+dmg,e.x,e.y,e.r,sx,sy,col||'#fff',size||15);
+ if(e.type==='flipper'&&e.hp>0&&(e.ec==='g'||e.ec==='b')){e.ec=other(e.ec);R.rings.push({x:e.x,y:e.y,r:e.r+9,t:0,life:0.25,col:colOf(e.ec)});sfx.flip();}
+ if(e.hp<=0)killEnemy(e,src,by);}
+// hc = the colour a hit carries ('w' = any). The wrong colour does no damage, but it still pops a bubble.
+function hurt(e,dmg,hc,src,sx,sy,col,size,by){if(e.dead)return false;if(e.bubble&&!e.under&&!e.air){popBubble(e);return true;}if(!matches(hc,e,sx,sy)){e.hitT=0.06;return false;}damageEnemy(e,dmg,src,sx,sy,col,size,by);return true;}
+// a push from a blast or wave: knocked enemies remember the colour that pushed them (THORN WALLS check it)
+function knock(e,nx,ny,kb,c){const m=e.kbm;if(!m||e.under||e.s.on)return;e.kx=nx*kb*m;e.ky=ny*kb*m;e.kdec=kb/0.5;e.kc=c;e.splatOk=false;e.lg=null;}
+function killEnemy(e,src,by){if(e.dead)return;e.dead=true;
+ const b=by||R.ball,c=b.chain||0;let s=(src==='mini'||src==='multi')?10:10*Math.max(1,c);if(fxOn('Gold'))s*=2;R.score+=s;R.kills++;R.totalKills++;burst(e.x,e.y,colOf(e.ec==='t'?'w':e.ec),5+2*Math.min(c,6));
+ if((fxOn('Gold')&&upL('Gold')>=3)||(fxOn('Star')&&upL('Star')>=3)){R.score+=50;pop('+50',e.x,e.y-e.r-18,'#ffd23f',15,0.7);sfx.coin();}
+ if(fxOn('Slowdown')&&upL('Slowdown')>=3){const f=R.fx.Slowdown;f.t+=0.5;f.max=Math.max(f.max,f.t);}
+ if(fxOn('Domino'))R.dq.push({x:e.x,y:e.y,c:e.ec==='x'||e.ec==='t'?(R.fx.Domino.c||'w'):e.ec,link:e.dlink||0,t:0.09});
+ const mb=R.ball;R.freeze=Math.max(R.freeze,Math.min(0.12,0.05+0.015*c));const sp=Math.hypot(mb.vx,mb.vy)||1;shake(Math.min(6,1+0.6*c),mb.vx/sp,mb.vy/sp);sfx.kill();vib(c>=5?30:14);
+ // a kill from a bank shot (the ball bounced off a wall first) gets its own shout, once a flick
+ if(R.hitBank&&src==='ball'&&R.bankPopF!==R.flicks){R.bankPopF=R.flicks;pop('BANKED!',clamp(e.x,70,W-70),hintY(e.y-e.r-34,e.y+e.r+34),'#ffd23f',20,0.8);sfx.bell(false);}
+ onDeath(e,src);
+ // the last enemy of a wave: a big burst and a moment of slow motion
+ if(R.phase==='wave'&&!loopRoom()&&waveDone())lastKillFx(e);}
+function lastKillFx(e){burst(e.x,e.y,'#ffffff',10);burst(e.x,e.y,colOf(e.ec==='t'?'w':e.ec),10);R.rings.push({x:e.x,y:e.y,r:90,t:0,life:0.45,col:'#ffffff'});R.freeze=Math.max(R.freeze,0.14);R.slowT=0.45;shake(6,0,1);vib(40);}
+// what happens when an enemy dies: splits, explosions, drops and rewards
+function onDeath(e,src){const T=ETYPES[e.type];
+ if(R.ball.leech===e)R.ball.leech=null;
+ if(e.mate){e.mate.mate=null;e.mate=null;}
+ if(e.type==='splitter'){const c=e.ec==='g'?'b':e.ec==='b'?'g':(Math.random()<0.5?'g':'b');for(const s of [-1,1])spawnAt('splitling',clamp(e.x+s*10,10,W-10),e.y,null,{ec:c});}
+ if(e.type==='bomber')R.booms.push({x:e.x,y:e.y,t:0.12,r:80});
+ if(e.el){if(R.phase==='wave'||R.phase==='boss')dropPickup(e.x,e.y);
+  if(e.el==='Golden'){R.score+=200;if(!loopRoom()){R.freeDue++;R.rewards.push('GOLDEN');}pop('GOLDEN! +1 PICK AFTER THE WAVE',180,110,'#ffd23f',15,1.6);sfx.coin();sfx.bell(true);}}
+ if(T.boss)bossPartDied(e);}
+// a hot ball (the main ball, the twin or the rival) touches an enemy. Its colour must match; the wrong colour only shoves (GHOST BALL: passes through).
+// CRUSH: a blue ball that hits at under CRUSH_V does +1 damage and big knockback. BANK: the last thing it touched was a wall.
+// Solid enemies (bosses, nests) also bounce the ball off.
+function isArmoured(e,nx,ny,b){if(e.frz>0)return false;if(e.shell)return true;const fd=Math.cos(e.face)*nx+Math.sin(e.face)*ny;
+ if((e.front||(R.heat>=3&&e.type==='tank'))&&fd>0.35)return true;
+ return false;}
+function solidBounce(b,e){circleBounce(b,e.x,e.y,e.r,b.heavy?0.85:0.9,0,false);}
+// a wrong-colour hit: a ring in the colour it needs every time, and (the first HINT_MAX times on this device, one every 2 s) words saying which pull
+// where a hint pop goes: above the thing, unless that is under the boss bar or off the top, then below it
+const hintY=(above,below)=>Math.min(above>=(R.boss?84:24)?above:below,AH-20);
+function wrongHint(e,c){const need=e.ec==='t'?c:e.ec;R.rings.push({x:e.x,y:e.y,r:e.r+8,t:0,life:0.35,col:colOf(need)});
+ if(META.hints>=HINT_MAX||R.hintT>0||!(need==='g'||need==='b'))return;R.hintT=2;META.hints++;
+ pop(e.ec==='t'?'HIT THE '+colName(c)+' HALF':need==='b'?'NEEDS A SHORT PULL':'NEEDS A FULL PULL',clamp(e.x,90,W-90),hintY(e.y-e.r-20,e.y+e.r+22),colOf(need),13,1.5);}
+function ballHit(b,e,nx,ny){const c=colourNow(b),main=b===R.ball,T=ETYPES[e.type];
+ if(e.bubble){b.chain++;chainBump(b);popBubble(e);b.vx*=0.92;b.vy*=0.92;b.last='enemy';b.wallRun=0;return;}
+ if(!matches(c,e,b.x,b.y)){if(main&&C.ghost&&!T.solid){if(!b.passed.has(e)){b.passed.add(e);if(C.ghost>=2){b.chain++;chainBump(b);pop('+1',e.x,e.y-e.r-14,'#d9e2ff',13,0.4);}}return;}if(main)wrongHint(e,c);shove(e,nx,ny,c,b);if(T.solid){solidBounce(b,e);e.armorT=0.12;sfx.clank();}return;}
+ if(isArmoured(e,nx,ny,b)){shove(e,nx,ny,c,b);sfx.clank();e.armorT=0.12;if(T.solid)solidBounce(b,e);return;}
+ const bank=b.last==='wall',crush=b.heavy&&Math.hypot(b.vx,b.vy)<CRUSH_V;let dmg=tierDmg(b.chain)+(bank?1:0)+C.dmgB+(main?b.snow||0:0);
+ if(crush)dmg+=CRUSH;
+ let x5=false;if(bank&&fxOn('BankBonus')){x5=upL('BankBonus')>=3&&b.wallRun>=2;dmg*=x5?5:3;}
+ let kb=(crush?KB_HEAVY:C.kb)*(e.maxHp>1?1.35:1)*C.kbMul*e.kbm;if(e.frz>0){kb*=1.25;if(hasCombo('BOWLING NIGHT'))e.pin=true;}
+ if(b.heavy)b.hits.add(e);
+ b.chain++;e.cd=0.2;e.lg=null;e.splatOk=true;e.kc=c;b.vx*=0.92;b.vy*=0.92;e.kx=-nx*kb;e.ky=-ny*kb;e.kdec=kb/0.5||1;b.last='enemy';b.wallRun=0;
+ if(crush)crushFx(b);if(bank)sfx.bank();sfx.hit(b.chain);if(!crush)vib(5);
+ if(main&&C.split&&!b.split){b.split=true;spawnMinis(b);}
+ if(main&&C.snow&&b.snow<C.snowMax){b.snow++;b.r=C.ballR+snowR(b.snow);}
+ if(bank&&fxOn('BankBonus'))pop(x5?'BANK ×5':'BANK ×3',e.x,e.y-e.r-30,'#ffd23f',15,0.5);
+ const gold=crush||bank;R.hitBank=bank&&main;damageEnemy(e,dmg,'ball',b.x,b.y,gold?'#ffd23f':'#fff',gold?20:16,b);R.hitBank=false;chainBump(b);
+ if(T.solid)solidBounce(b,e);}
+function shove(e,nx,ny,c,b){if(R.heat>=2&&b===R.ball&&b.chain>0){b.chain=0;pop('CHAIN LOST',b.x,b.y-b.r-26,'#ff8a5c',13,0.5);}let kb=(b.heavy?KB_HEAVY:C.kb+150)*(1+(C.kbMul-1)/2)*e.kbm;if(e.frz>0){kb*=1.25;if(hasCombo('BOWLING NIGHT'))e.pin=true;}
+ e.cd=0.25;e.lg=null;e.splatOk=false;e.kc=c;e.kx=-nx*kb;e.ky=-ny*kb;e.kdec=kb/0.5||1;if(b.heavy)b.hits.add(e);if(b===R.ball)puff(e.x-nx*e.r,e.y-ny*e.r);sfx.thunk();vib(6);}
+function crushFx(b){R.freeze=Math.max(R.freeze,0.09);const sp=Math.hypot(b.vx,b.vy)||1;shake(4,b.vx/sp,b.vy/sp);sfx.crush();vib(20);}
+// a knocked enemy slams a wall. SPLAT 1 if your ball hit it with its colour while flying fast (HEAVY BALL 3: 2).
+// THORN WALLS add damage to any enemy knocked by its own colour.
+function splat(e,side){const cx=side===0?0:side===1?W:e.x,cy=side===2?0:side===3?AH:e.y;const ok=matches(e.kc||'',e);e.kx=0;e.ky=0;
+ let d=0;if(ok){if(e.splatOk)d=C.heavy>=3?2:1;if(C.thorns)d+=C.thornD;}
+ if(!d){sparks(cx,cy,side);return;}
+ damageEnemy(e,d,'splat',cx,cy,'#ffe9a0',C.thorns?18:16);sparks(cx,cy,side);sfx.splat();if(C.thorns)vib(10);}
+// THUD: when a blue ball really stops (speed under 40), the enemies it hit this flick and any enemy within THUD_R are stunned; never bosses
+function thud(){const b=R.ball,T=THUD_T,TR=THUD_R;R.rings.push({x:b.x,y:b.y,r:TR,t:0,life:0.3,col:'#ffd23f'});let hit=0;
+ const near=R.enemies.filter(e=>Math.hypot(e.x-b.x,e.y-b.y)<TR+e.r);
+ for(const e of new Set([...b.hits,...near])){if(e.dead||e.stunCd>0||e.boss||e.under||e.air)continue;e.stun=T;e.stunCd=T+STUN_CD;e.lg=null;R.rings.push({x:e.x,y:e.y,r:e.r+12,t:0,life:0.3,col:'#ffd23f'});hit++;}
+ b.hits.clear();b.heavy=false;shake(5,0,1);sfx.thudHeavy();vib(25);return hit;}
+function addFire(x,y,r,life,c){R.fires.push({x,y,r,t:0,life,c:c||'w'});if(R.fires.length>90)R.fires.shift();}
+function spawnBurst(x,y,n,spd,life,c){for(let i=0;i<n;i++){const th=Math.PI/4+i*TAU/n;R.minis.push({x,y,vx:Math.cos(th)*spd,vy:Math.sin(th)*spd,r:6,t:0,life,hits:new Set(),c:c||'w'});}sfx.small();}
+function spawnMinis(b){const h=Math.atan2(b.vy,b.vx),n=C.split,c=colourNow(b);for(let i=0;i<n;i++){const a=(n===1?0:-50+100*i/(n-1))*Math.PI/180;R.minis.push({x:b.x,y:b.y,vx:Math.cos(h+a)*900,vy:Math.sin(h+a)*900,r:6,t:0,life:C.splitLife,hits:new Set(),c});}sfx.small();}
+// BLAST BALL: a ring at (x,y) hurting colour c
+function blastAt(x,y,c,r,d){R.rings.push({x,y,r,t:0,life:0.3,col:colOf(c)});R.rings.push({x,y,r:r*0.55,t:0,life:0.18,col:'#ffb13b'});burst(x,y,'#ff8a3c',6);sfx.pop();shake(5,0,0);vib(20);
+ for(const e of R.enemies){if(e.dead||e.under)continue;const dx=e.x-x,dy=e.y-y,dd=Math.hypot(dx,dy)||1;if(dd<r+e.r){knock(e,dx/dd,dy/dd,300,c);hurt(e,d,c,'blast',x,y,'#ffb13b',16);}}
+ hurtWallIn(x,y,r,d,c);}
+// BOUNCY WALLS 3: the first wall bounces of each flick send a small shockwave in the ball's colour
+function shockwave(x,y,c){const r=70;R.rings.push({x,y,r,t:0,life:0.3,col:colOf(c)});tone(140,0.08,'sine',0.12,70);
+ for(const e of R.enemies){if(e.dead||e.under)continue;const dx=e.x-x,dy=e.y-y,dd=Math.hypot(dx,dy)||1;if(dd<r+e.r){knock(e,dx/dd,dy/dd,300,c);hurt(e,1,c,'shock',x,y,'#9fe6ff',15);}}
+ hurtWallIn(x,y,r,1,c);}
+// THORN WALLS 3: a wall bounce zaps enemies standing along that wall near the hit point
+function thornZap(side,x,y,c){const reach=100;let n=0;
+ for(const e of R.enemies){if(e.dead||e.under)continue;const gap=side===0?e.x-e.r:side===1?W-e.x-e.r:side===2?e.y-e.r:AH-e.y-e.r,along=side<2?Math.abs(e.y-y):Math.abs(e.x-x);
+  if(gap<16&&along<reach&&hurt(e,1,c,'thorn',x,y,'#ffe9a0',15))n++;}
+ if(n)sfx.splat();}
+// POSTS 3: a hit post zaps enemies near it in the ball's colour
+function postZap(bu,c){R.rings.push({x:bu.x,y:bu.y,r:60,t:0,life:0.2,col:colOf(c)});for(const e of R.enemies){if(!e.dead&&!e.under&&Math.hypot(e.x-bu.x,e.y-bu.y)<60+e.r)hurt(e,1,c,'zap',bu.x,bu.y,'#d9e2ff',15);}}
+// CHAMELEON: the ball swaps colour (level 3: the 3rd swap turns it white for the rest of the flick)
+function flip(b){b.flips++;if(b===R.ball&&C.cham>=3&&b.flips>=3&&!b.white){b.white=true;pop('WHITE: ANY COLOUR',b.x,b.y-26,'#ffffff',13,0.6);}sfx.flip();R.rings.push({x:b.x,y:b.y,r:b.r+10,t:0,life:0.2,col:colOf(colourNow(b))});}
+// a wall bounce also shakes off a LEECH, and a bounce off the top of THE WALL hurts it
+function shakeLeech(b){const e=b.leech;b.leech=null;if(!e||e.dead)return;e.s.on=false;const sp=Math.hypot(b.vx,b.vy)||1;e.x=b.x-b.vx/sp*(b.r+e.r+2);e.y=b.y-b.vy/sp*(b.r+e.r+2);e.kx=-b.vx/sp*300;e.ky=-b.vy/sp*300;e.kdec=600;e.daze=1.2;e.cd=0.5;pop('SHAKEN OFF',e.x,e.y-e.r-14,'#cfd6ee',12,0.6);}
+function onWall(side,b){b.chain++;b.last='wall';b.wallRun++;b.bounces=(b.bounces||0)+1;if(side<4)R.wflash[side]=0.08;const s=Math.hypot(b.vx,b.vy)||1;shake(3,b.vx/s,b.vy/s);sparks(b.x,b.y,side);sfx.wall();vib(5);chainBump(b);
+ if(b.leech)shakeLeech(b);
+ if(side===4&&b.blk&&b.blk.boss&&b.bny<-0.6)wallHit(b);
+ if(C.cham&&(side<4||C.cham>=2))flip(b);
+ const c=colourNow(b);
+ if(b.shocks<C.shockN){b.shocks++;shockwave(b.x,b.y,c);}
+ if(C.thornZap&&side<4)thornZap(side,b.x,b.y,c);
+ if(C.blast>=3&&!b.blasted){b.blasted=true;blastAt(b.x,b.y,c,C.blastR,C.blastD);}}
+function onBumper(bu,b){b.chain++;b.last='wall';b.wallRun++;bu.hitT=0.15;const s=Math.hypot(b.vx,b.vy)||1;shake(3,b.vx/s,b.vy/s);sfx.wall();sfx.small();vib(12);chainBump(b);
+ if(C.cham>=2)flip(b);if(C.postZap)postZap(bu,colourNow(b));}
+// WRAP HOLES: FLIP SIDE swaps your colour on the way through
+function onWrap(b){sfx.wrap();if(hasCombo('FLIP SIDE'))flip(b);}
+
+// the ball takes a hit (a bite, a shot, a charge). A BOMBER blows up on it.
+function hurtBall(e,nx,ny){const b=R.ball;if(b.inv>0||R.phase==='dead'||R.phase==='bossdead')return;
+ if(e&&e.type==='bomber'&&!e.dead){e.dead=true;R.booms.push({x:e.x,y:e.y,t:0.01,r:80});}
+ const push=kb=>{if(e&&!e.dead&&e.kbm>0){e.kx=-nx*kb*e.kbm;e.ky=-ny*kb*e.kbm;e.kdec=kb/0.5;e.lg=null;e.lgCd=LUNGE_CD;}};
+ if(b.shield>0){b.shield--;b.shieldT=C.shieldRe;b.inv=0.4;push(700);R.rings.push({x:b.x,y:b.y,r:40,t:0,life:0.25,col:'#9fe6ff'});pop('BLOCKED',b.x,b.y-b.r-30,'#9fe6ff',18,0.5);sfx.clank();vib(20);return;}
+ R.hearts--;R.lost++;b.inv=0.8;R.freeze=Math.max(R.freeze,0.12);R.flash=0.3;shake(5,nx||0,ny||0);sfx.damage();vib(80);
+ push(800);pop('-1',b.x,b.y-b.r-34,'#ff4b4b',22,0.6);
+ if(R.hearts<=0){R.hearts=0;R.phase='dead';R.endT=1.0;buffered=null;pop('RUN OVER',180,200,'#ff6b6b',32,1.2);}}
+// ================= power-ups =================
+// one timer per owned power-up type; when it runs out a pickup appears (at most PU_MAX at once).
+// Its colour follows the enemies still to come; a blue pickup lands within a short pull of the ball, a green one needs a full pull.
+function puTick(dt){if(!(R.phase==='wave'||(R.phase==='boss'&&R.boss&&R.boss.active)))return;const TS=fxOn('TimeStop');
+ for(const k in R.pu){if(!R.upg[k])continue;const p=R.pu[k];p.t-=dt;if(p.t<=0){if(R.pickups.length<PU_MAX&&spawnPickup(k))p.t=puEvery(k,R.upg[k]);else p.t=1;}}
+ if(!TS){for(const q of R.pickups){q.t+=dt;if(q.wrong>0)q.wrong-=dt;}R.pickups=R.pickups.filter(q=>q.t<q.life);}}
+function spawnPickup(k){const b=R.ball;let c='w';
+ if(!CARDS[k].wild){const L=leftByCol();let pb=0.5;if(R.phase!=='boss'){if(!L.b&&L.g)pb=0;else if(!L.g&&L.b)pb=1;else if(L.b+L.g)pb=clamp(L.b/(L.b+L.g),0.2,0.8);}c=Math.random()<pb?'b':'g';}
+ const near=c==='b';
+ for(let i=0;i<70;i++){const relax=i>45,a=Math.random()*TAU,d=relax?(near?60+Math.random()*200:140+Math.random()*320):(near?70+Math.random()*100:(c==='w'?110:230)+Math.random()*190);const x=b.x+Math.cos(a)*d,y=b.y+Math.sin(a)*d;
+  if(x<28||x>W-28||y<28||y>AH-28)continue;
+  if(R.blocks.some(q=>x>q.x-24&&x<q.x+q.w+24&&y>q.y-24&&y<q.y+q.h+24))continue;
+  if(R.bumpers.some(u=>Math.hypot(x-u.x,y-u.y)<36)||R.kegs.some(u=>!u.dead&&Math.hypot(x-u.x,y-u.y)<36)||R.pickups.some(u=>Math.hypot(x-u.x,y-u.y)<50))continue;
+  if(R.enemies.some(e=>Math.hypot(x-e.x,y-e.y)<e.r+20)||(R.boss&&R.boss.wall&&x>R.boss.wall.x-24&&x<R.boss.wall.x+R.boss.wall.w+24&&y>R.boss.wall.y-24&&y<R.boss.wall.y+R.boss.wall.h+24))continue;
+  R.pickups.push({k,x,y,c,t:0,life:PU_LIFE,wrong:0});R.rings.push({x,y,r:30,t:0,life:0.3,col:colOf(c)});sfx.small();
+  if(!R.puSeen){R.puSeen=true;pop(c==='w'?'WILD PICKUP: ANY PULL GRABS IT':c==='b'?'BLUE PICKUP: GRAB IT WITH A SHORT PULL':colName('g')+' PICKUP: GRAB IT WITH A FULL PULL',180,AH-64,colOf(c),12,2.6);}
+  return true;}
+ return false;}
+// a ball touches a pickup: it grabs it when the colours match (white matches anything). The effect takes the pickup's colour.
+function grabCheck(b){if(!R.pickups.length)return;const c=colourNow(b);let took=false;
+ for(const q of R.pickups){if(q.gone)continue;if(Math.hypot(b.x-q.x,b.y-q.y)>=b.r+PU_R)continue;
+  if(q.c==='w'||c==='w'||c===q.c){q.gone=true;took=true;usePickup(q);}
+  else if(q.wrong<=0){q.wrong=0.8;pop('NEEDS '+colName(q.c),q.x,q.y-26,colOf(q.c),13,0.6);sfx.cancel();}}
+ if(took)R.pickups=R.pickups.filter(q=>!q.gone);}
+function usePickup(q){const k=q.k,L=R.upg[k]||1,c=q.c,x=q.x,y=q.y;R.grabs++;R.rings.push({x,y,r:44,t:0,life:0.35,col:colOf(c)});sfx.grab();vib(15);
+ pop(CARDS[k].name+'!',x,y-30,colOf(c),18,0.9);
+ if(k==='Bomb')bombAt(x,y,c,L);
+ else if(k==='Slowdown')setFx(k,[4,5,5][L-1],c);
+ else if(k==='Gold'){setFx(k,[6,8,8][L-1],c);sfx.coin();}
+ else if(k==='TimeStop'){setFx(k,[2,2.5,3][L-1],c);sfx.freeze();}
+ else if(k==='Freeze')freezeAt(x,y,c,L);
+ else if(k==='Tilt')tiltStart(c,L);
+ else if(k==='Twin'){R.twin.n+=[3,4,5][L-1];setFx(k,0.6,c);}
+ else if(k==='BankBonus')setFx(k,[6,8,8][L-1],c);
+ else if(k==='Domino')setFx(k,[5,7,7][L-1],c);
+ else if(k==='Paint')paintAll(c,[4,5,6][L-1]);
+ else if(k==='Star'){setFx(k,[4,5,6][L-1],'w');sfx.bell(true);}
+ else if(k==='Multi')spawnMulti(x,y,c,[2,3,4][L-1]);
+ else if(k==='Jar')lightning(x,y,c,L);}
+// BOMB: a wide ring; enemies of its colour take damage, everyone is pushed. FUSE (with kegs): every keg goes off too.
+function bombAt(x,y,c,L){const r=L>=2?125:100,d=L>=2?3:2;R.rings.push({x,y,r,t:0,life:0.32,col:colOf(c)});R.rings.push({x,y,r:r*0.55,t:0,life:0.2,col:'#ffffff'});burst(x,y,'#ffb13b',10);R.freeze=Math.max(R.freeze,0.07);shake(7,0,0);sfx.boom();vib(35);
+ for(const e of R.enemies){if(e.dead||e.under)continue;const dx=e.x-x,dy=e.y-y,dd=Math.hypot(dx,dy)||1;if(dd<r+e.r){knock(e,dx/dd,dy/dd,420,c);hurt(e,d,c,'bomb',x,y,'#ffb13b',18);}}
+ hurtWallIn(x,y,r,d,c);if(L>=3)addFire(x,y,70,3,c);setFx('Bomb',0.6,c);
+ if(hasCombo('FUSE'))for(const k of R.kegs)if(!k.dead&&!(k.lit>0)){k.lit=0.12+Math.random()*0.25;k.c=c;}}
+// FREEZE: enemies in a big ring around the pickup freeze; frozen enemies cannot move or bite and slide like pucks when hit
+function freezeAt(x,y,c,L){const r=L>=2?180:140,T=L>=2?4:3;R.rings.push({x,y,r,t:0,life:0.45,col:'#dff6ff'});sfx.freeze();
+ for(const e of R.enemies){if(e.dead||e.boss||e.under)continue;if(Math.hypot(e.x-x,e.y-y)<r+e.r){e.frz=T;e.frzC=c;e.lg=null;e.pin=false;e.glide=false;}}setFx('Freeze',T,c);}
+// frozen enemies of the freeze's colour shatter on a wall (FREEZE 3) or on anything at all while gliding on ice (GLACIER)
+function frzBreaks(e){return (upL('Freeze')>=3||e.glide)&&matches(e.frzC||'',e);}
+function shatter(e){if(e.dead)return;burst(e.x,e.y,'#dff6ff',10);R.rings.push({x:e.x,y:e.y,r:e.r+16,t:0,life:0.3,col:'#dff6ff'});pop('SHATTER',e.x,e.y-e.r-16,'#dff6ff',14,0.5);sfx.freeze();killEnemy(e,'shatter');}
+// a sliding frozen enemy runs into another: it knocks that one over and slows. BOWLING NIGHT: both take a hit in the colour that sent it.
+function pinHit(p,q,s,nx,ny){if(p.pinCd>0)return;p.pinCd=0.15;const kb=Math.min(700,s*0.8);q.kx=nx*kb;q.ky=ny*kb;q.kdec=kb/0.5;q.kc=p.kc;q.daze=Math.max(q.daze||0,0.6);q.lg=null;
+ p.kx*=0.35;p.ky*=0.35;sfx.thunk();shake(3,nx,ny);
+ if(p.pin){hurt(q,1,p.kc||'',"pin",p.x,p.y,'#dff6ff',16);hurt(p,1,p.kc||'','pin',q.x,q.y,'#dff6ff',16);pop('STRIKE',q.x,q.y-q.r-18,'#dff6ff',14,0.5);}
+ if(p.glide&&!p.dead&&frzBreaks(p))shatter(p);}
+// TILT: the floor tips toward the wall farthest from the ball, so the crowd slides away from you
+function tiltStart(c,L){const b=R.ball,ds=[b.x,W-b.x,b.y,AH-b.y];let side=0;for(let i=1;i<4;i++)if(ds[i]>ds[side])side=i;
+ R.tilt={side,c,L,spd:L>=2?230:170,hit:new Set()};setFx('Tilt',L>=2?4:3,c);sfx.whoosh();shake(5,side===0?-1:side===1?1:0,side===2?-1:side===3?1:0);}
+// an enemy pressed against the tilted wall. TILT 3: your colour takes 1 once. TIP IT: thorns grind any colour.
+function tiltWall(a,TL){if(TL.L>=3&&!TL.hit.has(a)&&matches(TL.c,a)){TL.hit.add(a);hurt(a,1,TL.c,'tilt',a.x,a.y,'#ffe9a0',15);}
+ if(!a.dead&&C.thorns&&hasCombo('TIP IT')&&!(a.tipCd>0)){a.tipCd=0.6;damageEnemy(a,C.thornD,'thorn',a.x,a.y,'#ffe9a0',16);sparks(a.x,a.y,TL.side);sfx.splat();}}
+// PAINT BUCKET: every enemy on screen (and the boss shell) turns the pickup's colour
+function paintAll(c,T){for(const e of R.enemies){if(e.dead)continue;e.paint=c;e.paintT=T;}
+ setFx('Paint',T,c);R.rings.push({x:R.ball.x,y:R.ball.y,r:320,t:0,life:0.5,col:colOf(c)});sfx.bell(false);}
+// MULTIBALL: extra balls in the pickup's colour that bounce at a steady speed and hurt their colour
+function spawnMulti(x,y,c,n){const life=6;for(let i=0;i<n;i++){const a=Math.random()*TAU;R.minis.push({x,y,vx:Math.cos(a)*650,vy:Math.sin(a)*650,r:8,t:0,life,hits:new Map(),c,multi:true});}setFx('Multi',life,c);sfx.small();}
+// LIGHTNING JAR: jumps to the nearest enemy of its colour, then up to n-1 more within 180
+function lightning(x,y,c,L){const n=[4,6,8][L-1],done=new Set(),pts=[{x,y}];let px=x,py=y,last=null;
+ for(let i=0;i<n;i++){let best=null,bd=i===0?1e9:180;for(const e of R.enemies){if(e.dead||done.has(e)||e.under||e.air||e.shell||e.invuln||!matches(c,e))continue;const d=Math.hypot(e.x-px,e.y-py);if(d<bd){bd=d;best=e;}}
+  if(!best)break;done.add(best);pts.push({x:best.x,y:best.y});px=best.x;py=best.y;last=best;
+  hurt(best,2,c,'zap',x,y,'#e9dcff',16);}
+ if(L>=3&&last&&!last.dead&&!last.boss){last.stun=2;last.stunCd=2.6;last.lg=null;}
+ if(pts.length<2)pop('NO '+colName(c)+' ENEMIES',x,y-44,'#cfd6ee',13,0.8);
+ R.bolts.push({pts,t:0,life:0.35,c});setFx('Jar',0.6,c);sfx.zap();shake(4,0,0);}
+// TWIN: each flick also launches a ball in the other colour from the mirrored spot, mirrored left to right, with that colour's speed
+function twinVel(v){const tc=v.tier==='b'?'g':'b',heavy=tc==='b',pw=v.pw||0;let spd=heavy?HEAVY_V0+(HEAVY_V1-HEAVY_V0)*clamp((pw-TIER_B)/(1-TIER_B),0,1):1000+200*clamp(pw/TIER_B,0,1);spd*=C.spdMul;const sp=Math.hypot(v.vx,v.vy)||1;return {tc,heavy,vx:-v.vx/sp*spd,vy:v.vy/sp*spd};}
+function launchTwin(v){const b=R.ball,t=twinVel(v);
+ R.twin.b={x:W-b.x,y:b.y,vx:t.vx,vy:t.vy,r:11,hot:true,hotT:0,heavy:t.heavy,col:t.tc,flips:0,white:false,chain:0,last:null,wallRun:0,hits:new Set(),trail:[],idle:0,touch:false,twin:true,wrapped:false};
+ R.rings.push({x:W-b.x,y:b.y,r:22,t:0,life:0.25,col:colOf(t.tc)});}
+function twinStep(dt){const t=R.twin.b;if(!t)return;
+ const s=slowStep(t,dt);
+ if(s>0){bounceMove(t,dt,R.bumpers,(h,bb)=>{bb.chain++;bb.last='wall';bb.wallRun++;bb.bounces=(bb.bounces||0)+1;sparks(bb.x,bb.y,h);sfx.wall();if(h===4&&bb.blk&&bb.blk.boss&&bb.bny<-0.6)wallHit(bb);},(bu,bb)=>{bb.chain++;bb.last='wall';bb.wallRun++;bu.hitT=0.15;});if(t.wrapped)t.trail.length=0;}
+ if(t.hot){t.trail.push({x:t.x,y:t.y});if(t.trail.length>10)t.trail.shift();
+  for(const e of R.enemies){if(e.dead||e.cd>0||e.air||e.under||e.s.on||e.s.fade||(e.boss&&!e.boss.active))continue;const dx=t.x-e.x,dy=t.y-e.y,d=Math.hypot(dx,dy);if(d>=t.r+e.r)continue;ballHit(t,e,d>0?dx/d:1,d>0?dy/d:0);if(R.phase==='bossdead')break;}}
+ else t.trail.length=0;
+ grabCheck(t);
+ if(s===0){t.idle+=dt;if(t.idle>0.7){puff(t.x,t.y);R.twin.b=null;}}}
+// DOMINO: each kill during it blows up a moment later, hurting the dead enemy's colour nearby (level 3: bigger with each link)
+function dominoStep(dt){if(!R.dq.length)return;for(const q of R.dq)q.t-=dt;const go=R.dq.filter(q=>q.t<=0);if(!go.length)return;R.dq=R.dq.filter(q=>q.t>0);const L=upL('Domino')||1;
+ for(const q of go){const r=(L>=2?65:55)+(L>=3?12*q.link:0);R.rings.push({x:q.x,y:q.y,r,t:0,life:0.25,col:colOf(q.c)});sfx.pop();shake(3,0,0);
+  if(hasCombo('WILDFIRE'))addFire(q.x,q.y,Math.min(60,r*0.6),2,q.c);
+  for(const e of R.enemies){if(e.dead||e.under)continue;const dx=e.x-q.x,dy=e.y-q.y,dd=Math.hypot(dx,dy)||1;if(dd<r+e.r&&matches(q.c,e)){e.dlink=q.link+1;knock(e,dx/dd,dy/dd,260,q.c);hurt(e,1,q.c,'domino',q.x,q.y,colOf(q.c),15);}}}}
+
+// ================= stepping =================
+function ballStep(dt){const b=R.ball;
+ if(b.commit>0){b.commit-=dt;if(b.commit<=0&&buffered){fire(buffered);buffered=null;}}
+ const wasHot=b.hot,moving=b.vx!==0||b.vy!==0;
+ const s=slowStep(b,dt);
+ if(wasHot&&!b.hot){puff(b.x,b.y);sfx.skid();b.trail.length=0;}
+ if(moving&&s===0){if(b.heavy)thud();if(C.blast)blastAt(b.x,b.y,colourNow(b),C.blastR,C.blastD);meltSnow(b);}
+ if(s>0){bounceMove(b,dt,R.bumpers,onWall,onBumper);if(b.wrapped){b.trail.length=0;onWrap(b);}}
+ if(b.hot){b.trail.push({x:b.x,y:b.y});if(b.trail.length>12)b.trail.shift();}
+ if(C.fire&&b.hot){b.fireT-=dt;if(b.fireT<=0){b.fireT=0.04;addFire(b.x,b.y,14,C.trailLife,colourNow(b));}}
+ if(b.inv>0)b.inv-=dt;
+ if(C.shieldMax&&b.shield<C.shieldMax){b.shieldT-=dt;if(b.shieldT<=0){b.shield++;b.shieldT=C.shieldRe;R.rings.push({x:b.x,y:b.y,r:b.r+14,t:0,life:0.3,col:'#9fe6ff'});sfx.small();}}
+ if(C.snow&&b.hot&&R.ice.length&&hasCombo('AVALANCHE')){const ip=onIce(b.x,b.y);if(ip&&!b.iceSeen.has(ip.i)){b.iceSeen.add(ip.i);if(b.snow<C.snowMax+1){b.snow++;b.r=C.ballR+snowR(b.snow);pop('AVALANCHE',b.x,b.y-b.r-16,'#dff6ff',13,0.5);}}}
+ grabCheck(b);
+ const es=R.enemies,TS=fxOn('TimeStop');
+ if(b.hot){
+  for(const e of es){if(e.dead||e.cd>0||e.air||e.under||e.s.on||(e.s.fade&&!C.ghost)||(e.boss&&!e.boss.active))continue;const dx=b.x-e.x,dy=b.y-e.y,d=Math.hypot(dx,dy);if(d>=b.r+e.r)continue;ballHit(b,e,d>0?dx/d:1,d>0?dy/d:0);if(R.phase==='bossdead')break;}
+ }else if(R.phase!=='dead'&&R.phase!=='bossdead'){
+  for(const e of es){if(e.dead||e.air||e.under||e.s.on||e.s.fade)continue;const dx=b.x-e.x,dy=b.y-e.y,d=Math.hypot(dx,dy);if(d>=b.r+e.r)continue;const nx=d>0?dx/d:1,ny=d>0?dy/d:0;
+   // solid bodies push a resting ball out of the way
+   if(ETYPES[e.type].solid){b.x=clamp(e.x+nx*(b.r+e.r+1),b.r,W-b.r);b.y=clamp(e.y+ny*(b.r+e.r+1),b.r,AH-b.r);}
+   if(b.inv>0||TS||!bites(e)||e.stun>0||e.daze>0||e.frz>0||e.s.dizzy>0||(e.boss&&!e.boss.active))continue;
+   hurtBall(e,nx,ny);if(ETYPES[e.type].solid){b.vx=nx*280;b.vy=ny*280;}
+   if(e.type==='jugg'&&e.s.st==='charge')juggCrack(e);
+   break;}
+ }}
+// mini balls (SPLITTER, SHRAPNEL) hit each enemy once; MULTIBALL balls keep bouncing and can hit the same enemy again after 0.4 s
+function minisStep(dt){const pin=hasCombo('PINBALL');
+ for(const m of R.minis){m.t+=dt;wallStep(m,dt,1,0,null);
+  if(pin||m.multi)for(const bu of R.bumpers){if(circleBounce(m,bu.x,bu.y,bu.r,1,0,m.multi?650:900)&&pin&&!m.multi){if((m.ext||0)<3){m.ext=(m.ext||0)+1;m.life=Math.max(m.life,m.t+0.5);}if(!(bu.zapT>0)){bu.zapT=0.3;bu.hitT=0.15;R.rings.push({x:bu.x,y:bu.y,r:60,t:0,life:0.2,col:'#b48cff'});sfx.small();for(const e of R.enemies){if(!e.dead&&Math.hypot(e.x-bu.x,e.y-bu.y)<60+e.r)hurt(e,1,m.c,'zap',bu.x,bu.y,'#d9c4ff',15);}}}}
+  for(const e of R.enemies){if(e.dead||e.under||e.air||e.s.on||e.s.fade)continue;const dx=m.x-e.x,dy=m.y-e.y,d=Math.hypot(dx,dy);if(d>=m.r+e.r)continue;
+   if(m.multi){const last=m.hits.get(e);if(last!=null&&m.t-last<0.4)continue;m.hits.set(e,m.t);circleBounce(m,e.x,e.y,e.r,1,0,650);
+    if(e.bubble)popBubble(e);else if(matches(m.c,e,m.x,m.y)){const nx=d>0?dx/d:1,ny=d>0?dy/d:0;knock(e,-nx,-ny,250,m.c);damageEnemy(e,1,'multi',m.x,m.y);sfx.small();}else sfx.thunk();continue;}
+   if(m.hits.has(e))continue;m.hits.add(e);
+   if(e.bubble){popBubble(e);continue;}if(!matches(m.c,e,m.x,m.y)){circleBounce(m,e.x,e.y,e.r,1,0,false);sfx.thunk();continue;}
+   damageEnemy(e,1,'mini',m.x,m.y);sfx.small();
+   if(C.split2&&!m.gen2&&!m.split){m.split=true;const h=Math.atan2(m.vy,m.vx);for(const a of [-0.7,0.7])R.minis.push({x:m.x,y:m.y,vx:Math.cos(h+a)*850,vy:Math.sin(h+a)*850,r:5,t:0,life:0.7,hits:new Set([e]),c:m.c,gen2:true});}}}
+ R.minis=R.minis.filter(m=>m.t<m.life);}
+// squads: when fewer than the squad's low are alive (or waiting at a door) and its gap has passed, send the next one.
+function countAlive(){let n=0;for(const e of R.enemies)if(!e.dead&&!e.placed&&!ETYPES[e.type].noCount)n++;return n;}
+function waveSpawn(dt){R.waveT+=dt;const w=R.wv;
+ R.spawnT-=dt;const q=R.squads[0];if(!q)return;const low=q.low!=null?q.low:(w.low||SQUAD_LOW);
+ if(R.spawnT<=0&&countAlive()+R.pending.length<low){R.squads.shift();R.spawnT=q.gap!=null?q.gap:(w.gap||SQUAD_GAP);spawnSquad(q);}}
+// a door squad deals its enemies round-robin across its doors; a ring squad appears in a circle round the ball
+function spawnSquad(q){if(q.pop){pop(q.pop,180,64,'#ff8a5c',20,1.4);sfx.roar();}
+ if(q.ring){const b=R.ball,n=q.toks.length;for(let i=0;i<n;i++){const a=i*TAU/n;let dx=Math.cos(a)*160,dy=Math.sin(a)*160;if(b.x+dx<20||b.x+dx>W-20)dx=-dx;if(b.y+dy<20||b.y+dy>AH-20)dy=-dy;
+  R.pending.push({tok:q.toks[i],door:-1,x:clamp(b.x+dx,20,W-20),y:clamp(b.y+dy,20,AH-20),t:1.4,ph:R.orderI*1.7});R.orderI++;}return;}
+ const nd=q.d.length,cnt=q.d.map((_,j)=>Math.floor((q.toks.length-j+nd-1)/nd));
+ for(let i=0;i<q.toks.length;i++){const j=i%nd,di=q.d[j],k=Math.floor(i/nd);R.pending.push({tok:q.toks[i],door:di,t:0.8,off:(k-(cnt[j]-1)/2)*28,ph:R.orderI*1.7});R.orderI++;R.doorGlow[di]=0.8;}}
+function queueTok(t,di){R.pending.push({tok:t,door:di,t:0.8,off:0,ph:R.orderI*1.7});R.orderI++;R.doorGlow[di]=0.8;}
+function pendingStep(dt){for(let i=R.pending.length-1;i>=0;i--){const p=R.pending[i];p.t-=dt;if(p.t>0)continue;R.pending.splice(i,1);const T=ETYPES[p.tok.type]||ETYPES.runner;let x,y;
+  if(p.door<0){x=p.x;y=p.y;}else{const dr=DOORS[p.door],ins=T.r+4,o=p.off||0;x=dr.x;y=dr.y;if(dr.s===0){x=ins;y+=o;}else if(dr.s===1){x=W-ins;y+=o;}else{y=ins;x+=o;}x=clamp(x,ins,W-ins);y=clamp(y,ins,AH-ins);}
+  spawnAt(p.tok.type,x,y,p.ph,p.tok);}
+ for(let i=0;i<6;i++)if(R.doorGlow[i]>0)R.doorGlow[i]-=dt;}
+// per-kind starting state
+const INIT={
+ burrower:e=>{e.s={st:'walk',t:2+Math.random()}},
+ charger:e=>{e.s={st:'walk',t:1.5+Math.random(),dizzy:0}},
+ spitter:e=>{e.s={t:2+Math.random()}},
+ shield:e=>{e.front=true},
+ nest:e=>{e.s={t:2.5}},
+ medic:e=>{e.s={t:2}},
+};
+function spawnAt(type,x,y,ph,o){o=o||{};
+ if(type==='pair'){const a=spawnAt('runner',x,y,ph,{}),c=spawnAt('tank',clamp(x+(x<W/2?18:-18),14,W-14),clamp(y+(y<AH/2?18:-18),14,AH-14),ph,{});a.mate=c;c.mate=a;return a;}
+ const T=ETYPES[type]||ETYPES.runner,b=R.ball;let ec=o.ec||T.ec;if(ec==='e')ec=Math.random()<0.5?'g':'b';if(R.forceEc&&(ec==='g'||ec==='b')&&!T.boss)ec=R.forceEc;
+ const e={type,ec,x,y,r:T.r,hp:T.hp,maxHp:T.hp,spd:T.spd,paint:null,paintT:0,daze:0,t:0,ph:ph!=null?ph:R.orderI*1.7,cd:0,kx:0,ky:0,kdec:0,kc:'',face:Math.atan2(b.y-y,b.x-x),hitT:0,dead:false,stun:0,stunCd:0,lg:null,lgCd:0,frz:0,frzC:'',glide:false,pin:false,pinCd:0,tipCd:0,dlink:0,
+  el:'',bubble:0,front:false,shell:false,invuln:false,armorT:0,tA:Math.random()*TAU,kbm:T.kbm!=null?T.kbm:1,sm:1,s:{},hold:!!o.hold,placed:false,air:false,under:false,free:false,wallSide:-1,age:0,boss:null,target:false};
+ if(R.wv&&R.wv.slow&&!T.boss)e.spd*=R.wv.slow;
+ if(INIT[type])INIT[type](e);
+ if(!R.practice&&!T.boss&&!T.bit&&ETYPES[type].rule&&!META.named.includes(type)){META.named.push(type);e.nameT=3.5;save();}
+ if(o.el)applyTwist(e,o.el);
+ R.enemies.push(e);return e;}
+function applyTwist(e,k){if(!TWISTS[k])return;e.el=k;
+ if(k==='Big'){e.r=Math.round(e.r*1.6);e.hp*=2;e.maxHp=e.hp;e.kbm*=0.6;}
+ else if(k==='Golden')e.s.gold=15;}
+// a boss's helper, kept inside the room
+// an elite, a thief or a test drops a pickup: one of your power-ups if you have any, otherwise any power-up at level 1
+function dropPickup(x,y){const own=Object.keys(R.upg).filter(k=>famOf(k)==='POWER'),pool=own.length?own:CARD_KEYS.filter(k=>famOf(k)==='POWER'&&k!=='Star'&&cardOn(k)),k=pickR(pool);
+ const L=leftByCol();let pb=0.5;if(!L.b&&L.g)pb=0;else if(!L.g&&L.b)pb=1;const c=CARDS[k].wild?'w':Math.random()<pb?'b':'g';x=clamp(x,28,W-28);y=clamp(y,28,AH-28);
+ R.pickups.push({k,x,y,c,t:0,life:PU_LIFE+2,wrong:0});R.rings.push({x,y,r:30,t:0,life:0.3,col:colOf(c)});sfx.small();}
+
+// ================= enemy behaviour =================
+// helpers for the AIs below
+function keepAway(e,ux,uy,d,spd,near,far){if(d<near)return [-ux*spd,-uy*spd];if(d>far)return [ux*spd,uy*spd];const w=Math.sin(e.t*0.8+e.ph)>0?1:-1;return [-uy*spd*0.5*w,ux*spd*0.5*w];}
+// run from the ball, sliding along walls rather than into a corner
+function flee(e,ux,uy,d,spd){let vx=-ux,vy=-uy;const m=40;if(e.x<m)vx=Math.abs(vx)+0.6;if(e.x>W-m)vx=-Math.abs(vx)-0.6;if(e.y<m)vy=Math.abs(vy)+0.6;if(e.y>AH-m)vy=-Math.abs(vy)-0.6;const l=Math.hypot(vx,vy)||1,k=d>260?0.3:1;return [vx/l*spd*k,vy/l*spd*k];}
+function escape(e,msg){e.dead=true;e.escaped=true;puff(e.x,e.y);if(msg)pop(msg,clamp(e.x,70,W-70),e.y-e.r-16,'#ff8a5c',13,0.9);}
+// a ray from (x,y) along (dx,dy) to the first wall or block
+function rayEnd(x,y,dx,dy){let px=x,py=y;for(let l=0;l<900;l+=4){px=x+dx*l;py=y+dy*l;if(px<0||px>W||py<0||py>AH)break;if(R.blocks.some(k=>px>k.x&&px<k.x+k.w&&py>k.y&&py<k.y+k.h))break;}return {x:px,y:py};}
+function shockAt(x,y,r){const b=R.ball;R.rings.push({x,y,r,t:0,life:0.35,col:'#ff8a5c'});if(!b.hot&&b.inv<=0){const d=Math.hypot(b.x-x,b.y-y);if(d<r+b.r)hurtBall(null,(b.x-x)/(d||1),(b.y-y)/(d||1));}}
+function knightCopy(v){const bs=R.boss;if(!bs||bs.key!=='knight'||!bs.active)return;const k=bs.parts[0];if(!k||k.dead||k.s.dizzy>0)return;const m=0.9*(bs.phase===2?1.15:1);
+ k.s.copy={vx:-v.vx*m,vy:v.vy*m,heavy:!!v.heavy,col:v.tier||'g',t:0.25};}
+// each AI returns the velocity it wants this step. spd already has slowdown, drummers, leaders and Swift in it.
+const AI={
+ zig:(e,dt,ux,uy,d,SL,spd)=>{const w=Math.sin(e.t*3+e.ph)*1.1;return [(ux-uy*w)*spd,(uy+ux*w)*spd];},
+ burrower:(e,dt,ux,uy,d,SL,spd)=>{const s=e.s,b=R.ball;s.t-=dt*SL;
+  if(s.st==='walk'){if(s.t<=0&&d<300){s.st='under';s.t=2;e.under=true;s.tx=clamp(b.x,20,W-20);s.ty=clamp(b.y,20,AH-20);burst(e.x,e.y,'#7a5a3a',5);sfx.thunk();}return [ux*spd,uy*spd];}
+  if(s.st==='under'){const ddx=s.tx-e.x,ddy=s.ty-e.y,dd=Math.hypot(ddx,ddy);
+   if(s.t<=0){e.x=s.tx;e.y=s.ty;e.under=false;s.st='walk';s.t=2.5+Math.random();burst(e.x,e.y,'#7a5a3a',8);shake(3,0,0);sfx.thud();return [0,0];}
+   const v=Math.min(dd/Math.max(0.05,s.t),400);return dd>1?[ddx/dd*v,ddy/dd*v]:[0,0];}
+  return [0,0];},
+ charger:(e,dt,ux,uy,d,SL,spd)=>{const s=e.s;s.t-=dt*SL;
+  if(s.st==='walk'){if(s.t<=0&&d<320){s.st='glow';s.t=0.9;s.lock=false;}return [ux*spd,uy*spd];}
+  if(s.st==='glow'){if(s.t<0.25&&!s.lock){s.lock=true;s.dx=ux;s.dy=uy;}if(s.t<=0){s.st='rush';s.t=1.6;if(!s.lock){s.dx=ux;s.dy=uy;}s.sx=e.x;s.sy=e.y;sfx.lunge();}return [0,0];}
+  if(s.st==='rush'){const moved=Math.hypot(e.x-s.sx,e.y-s.sy)>16;
+   if(moved&&(e.wallSide>=0||s.bump)){s.st='dizzy';s.t=2;s.dizzy=2;shake(4,s.dx,s.dy);sfx.clank();burst(e.x,e.y,'#ffe9a0',5);pop('DIZZY: +1 DAMAGE',e.x,e.y-e.r-14,'#ffe9a0',12,0.8);return [0,0];}
+   if(s.t<=0){s.st='walk';s.t=2;}const v=420*SL*e.sm;return [s.dx*v,s.dy*v];}
+  if(s.st==='dizzy'){s.dizzy=s.t;if(s.t<=0){s.st='walk';s.t=2;s.dizzy=0;}return [0,0];}
+  return [0,0];},
+ spitter:(e,dt,ux,uy,d,SL,spd)=>{const s=e.s,b=R.ball;s.t-=dt*SL;
+  if(s.t<=0&&!b.hot&&b.coldT>0.3&&d<440){s.t=3.2;R.shots.push({x:e.x+ux*e.r,y:e.y+uy*e.r,vx:ux*150,vy:uy*150,r:7,t:0,life:4,kind:'glob',c:e.ec});sfx.splat();}
+  return keepAway(e,ux,uy,d,spd,170,240);},
+ nest:(e,dt,ux,uy,d,SL)=>{e.s.t-=dt*SL;if(e.s.t<=0){e.s.t=4;if(R.enemies.length<14&&R.phase==='wave'){const a=Math.random()*TAU;spawnAt('runner',clamp(e.x+Math.cos(a)*(e.r+12),14,W-14),clamp(e.y+Math.sin(a)*(e.r+12),14,AH-14),null,{ec:'g'});R.rings.push({x:e.x,y:e.y,r:e.r+10,t:0,life:0.3,col:'#d9e2ff'});sfx.small();}}return [0,0];},
+ medic:(e,dt,ux,uy,d,SL,spd)=>{const s=e.s;s.t-=dt*SL;
+  if(s.t<=0){s.t=2;let n=0;for(const o of R.enemies){if(o===e||o.dead||o.boss||o.hp>=o.maxHp)continue;if(Math.hypot(o.x-e.x,o.y-e.y)<100){o.hp++;n++;pop('+1',o.x,o.y-o.r-12,'#7dffa0',13,0.5);}}if(n){R.rings.push({x:e.x,y:e.y,r:100,t:0,life:0.35,col:'#7dffa0'});sfx.small();}}
+  let cx=0,cy=0,n=0;for(const o of R.enemies)if(o!==e&&!o.dead){cx+=o.x;cy+=o.y;n++;}if(!n)return keepAway(e,ux,uy,d,spd,150,220);
+  cx/=n;cy/=n;const tx=cx-ux*40,ty=cy-uy*40,ddx=tx-e.x,ddy=ty-e.y,dd=Math.hypot(ddx,ddy);return dd>4?[ddx/dd*spd,ddy/dd*spd]:[0,0];},
+ // ---- boss parts ----
+ king:(e,dt,ux,uy,d,SL)=>{const bs=e.boss;if(!bs.active)return [0,0];const rage=bs.phase===2,mv=(rage?55:32)*SL;let vx=ux*mv,vy=uy*mv;
+  for(const o of bs.parts){if(o===e||o.dead)continue;const dx=e.x-o.x,dy=e.y-o.y,dd=Math.hypot(dx,dy)||1;if(dd<130){vx+=dx/dd*45;vy+=dy/dd*45;}}
+  return [vx,vy];},
+ knight:(e,dt,ux,uy,d,SL)=>{const bs=e.boss,s=e.s,p2=bs.phase===2;if(!bs.active)return [0,0];
+  if(s.dizzy>0){s.dizzy-=dt;e.shell=s.dizzy<=0;return [0,0];}
+  e.shell=true;
+  if(s.copy){s.copy.t-=dt;if(s.copy.t<=0){s.dash={vx:s.copy.vx,vy:s.copy.vy,heavy:s.copy.heavy};e.ec=s.copy.col;s.copy=null;s.sx=e.x;s.sy=e.y;sfx.launch();}}
+  if(s.dash){const g=s.dash,sp=Math.hypot(g.vx,g.vy),moved=Math.hypot(e.x-s.sx,e.y-s.sy)>14;
+   if(moved&&e.wallSide>=0&&sp>350){s.dash=null;s.dizzy=p2?2.5:3;e.shell=false;shake(5,0,0);sfx.clank();burst(e.x,e.y,'#d9dfe8',8);pop('CRASH! HIT IT',e.x,clamp(e.y-e.r-16,64,AH-20),'#ffd23f',15,1.2);return [0,0];}
+   if(moved&&(e.wallSide===0||e.wallSide===1))g.vx=-g.vx*0.8;if(moved&&(e.wallSide===2||e.wallSide===3))g.vy=-g.vy*0.8;
+   const ns=Math.max(0,sp-(g.heavy?HEAVY_DECEL:DECEL)*dt*SL);if(ns<40){s.dash=null;return [0,0];}g.vx*=ns/sp;g.vy*=ns/sp;
+   return [g.vx*SL,g.vy*SL];}
+  // between dashes it walks toward you, but not up under the boss bar
+  let vy=uy*20*SL;if(e.y<e.r+64)vy=Math.max(vy,30*SL);return [ux*20*SL,vy];},
+ jugg:(e,dt,ux,uy,d,SL)=>{const bs=e.boss,s=e.s,p2=bs.phase===2,b=R.ball;if(!bs.active)return [0,0];s.t-=dt*SL;
+  if(s.st==='aim'){e.shell=true;if(s.t>0.4){s.dx=ux;s.dy=uy;}e.face=Math.atan2(s.dy,s.dx);if(s.t<=0){s.st='charge';s.t=3;s.n++;s.bounced=false;s.sx=e.x;s.sy=e.y;sfx.roar();}return [0,0];}
+  if(s.st==='charge'){e.shell=true;const v=(p2?600:480)*SL,moved=Math.hypot(e.x-s.sx,e.y-s.sy)>20;
+   if(moved&&(e.wallSide>=0||s.bump)){shockAt(e.x,e.y,p2?110:70);shake(7,s.dx,s.dy);sfx.boom();
+    if(p2&&!s.bounced){s.bounced=true;const dx=b.x-e.x,dy=b.y-e.y,dd=Math.hypot(dx,dy)||1;s.dx=dx/dd;s.dy=dy/dd;s.sx=e.x;s.sy=e.y;s.t=3;return [s.dx*v,s.dy*v];}
+    juggCrack(e);return [0,0];}
+   for(const o of R.enemies){if(o===e||o.dead||o.boss)continue;const dx=o.x-e.x,dy=o.y-e.y,dd=Math.hypot(dx,dy)||1;if(dd<o.r+e.r+2)knock(o,dx/dd,dy/dd,500,'');}
+   if(s.t<=0){juggCrack(e);return [0,0];}return [s.dx*v,s.dy*v];}
+  if(s.st==='crack'){e.shell=false;if(s.t<=0){s.st='aim';s.t=p2?0.9:1.3;e.ec=other(e.ec);e.shell=true;R.rings.push({x:e.x,y:e.y,r:e.r+16,t:0,life:0.3,col:colOf(e.ec)});}return [0,0];}
+  return [0,0];}
+};
+// JUGGERNAUT: a charge always ends with its armour cracked for 2 s, even when it runs into your ball
+function juggCrack(e){const s=e.s;s.st='crack';s.t=2.0;e.shell=false;pop('CRACKED: HIT IT NOW',e.x,clamp(e.y-e.r-18,64,AH-20),'#ffd23f',14,1.2);}
+// does this enemy bite a resting ball?
+function bites(e){if(e.harm!=null)return e.harm;return !ETYPES[e.type].harmless&&!e.target;}
+function enemiesStep(dt){const b=R.ball,es=R.enemies;
+ // TIME STOP: nothing moves; hits wait in the enemies and fly when time comes back
+ if(fxOn('TimeStop')){for(const e of es)if(e.hitT>0)e.hitT-=dt;return;}
+ const SLOW=fxOn('Slowdown')?1/3:1,TL=fxOn('Tilt')?R.tilt:null,glacier=hasCombo('GLACIER'),ice3=C.ice>=3,paintP2=R.patches.length&&R.boss&&R.boss.phase===2;
+ for(const e of es)e.sm=1;
+ for(const e of es){if(e.dead)continue;if(e.stun>0)e.stun-=dt;if(e.daze>0)e.daze-=dt;if(e.nameT>0)e.nameT-=dt;if(e.stunCd>0)e.stunCd-=dt;if(e.lgCd>0)e.lgCd-=dt;if(e.paintT>0)e.paintT-=dt;if(e.fireCd>0)e.fireCd-=dt;if(e.tipCd>0)e.tipCd-=dt;if(e.pinCd>0)e.pinCd-=dt;if(e.armorT>0)e.armorT-=dt;e.age+=dt;
+  if(e.s.fx&&e.s.fx.t>0)e.s.fx.t-=dt;
+  if(e.el==='Golden'){e.s.gold-=dt;if(e.s.gold<=0){escape(e,'GOLDEN GOT AWAY');continue;}}
+  if(e.frz>0){e.frz-=dt;if(e.frz<=0){e.frz=0;e.glide=false;e.pin=false;puff(e.x,e.y);}}
+  const st=e.stun>0||e.daze>0||e.frz>0;if(!st)e.t+=dt;if(e.cd>0)e.cd-=dt;if(e.hitT>0)e.hitT-=dt;
+  // a leech riding the ball
+  if(e.s.on){e.x=b.x+Math.cos(e.s.a)*(b.r+e.r-3);e.y=b.y+Math.sin(e.s.a)*(b.r+e.r-3);continue;}
+  if(paintP2&&!e.boss){const p=onPatch(e.x,e.y);if(p&&(e.ec==='g'||e.ec==='b')){e.paint=p.c;e.paintT=Math.max(e.paintT,0.3);}}
+  const dx=b.x-e.x,dy=b.y-e.y,d=Math.hypot(dx,dy)||1,ux=dx/d,uy=dy/d;let vx=0,vy=0;
+  if(!st){const fa=Math.atan2(uy,ux);if(e.type==='tank'||e.front){const mx=TANK_TURN*SLOW*dt;e.face+=clamp(angDiff(fa,e.face),-mx,mx);}else if(e.type!=='jugg')e.face=fa;}
+  if(e.ec==='t')e.tA+=0.6*dt*SLOW;
+  // cold ball nearby: crouch LUNGE_CROUCH s (standing still), then dash LUNGE_D straight at where the ball is when the crouch ends
+  const canLunge=!ETYPES[e.type].noLunge&&!e.target&&!e.hold&&!e.boss&&!e.air&&!e.under&&!e.s.fade&&e.el!=='Golden';
+  if(st)e.lg=null;
+  else if(canLunge&&!e.lg&&e.lgCd<=0&&!b.hot&&!e.kx&&!e.ky&&d<LUNGE_R&&R.phase!=='dead'&&R.phase!=='bossdead')e.lg={ph:0,t:LUNGE_CROUCH,ux:0,uy:0,d:0};
+  if(!st){const g=e.lg;
+   if(g&&g.ph===0){g.t-=dt*SLOW;if(g.t<=0){g.ph=1;g.ux=ux;g.uy=uy;sfx.lunge();}}
+   if(g&&g.ph===1){vx=g.ux*LUNGE_V*SLOW;vy=g.uy*LUNGE_V*SLOW;g.d+=LUNGE_V*SLOW*dt;if(g.d>=LUNGE_D){e.lg=null;e.lgCd=LUNGE_CD;}}
+   else if(!g){const spd=e.spd*e.sm*SLOW;
+    if(e.target||e.hold){vx=0;vy=0;}
+    else if(e.el==='Golden'){const v=flee(e,ux,uy,d,Math.max(spd,60)*1.25+30);vx=v[0];vy=v[1];}
+    else if(AI[e.type]){const v=AI[e.type](e,dt,ux,uy,d,SLOW,spd);if(v){vx=v[0];vy=v[1];}}
+    else{vx=ux*spd;vy=uy*spd;}}}
+  if(e.dead)continue;
+  if(TL&&e.kbm>0&&!e.under){const s=TL.spd;vx+=TL.side===0?-s:TL.side===1?s:0;vy+=TL.side===2?-s:TL.side===3?s:0;}
+  // knockback fades; frozen enemies slide like pucks (GLACIER: no friction at all on ice), ICE 3: everyone slides on ice
+  if(e.kx||e.ky){vx+=e.kx;vy+=e.ky;let kd=e.kdec;const onI=R.ice.length?onIce(e.x,e.y):null;
+   if(e.frz>0){if(glacier&&onI){kd=0;e.glide=true;}else kd*=0.18;}else if(ice3&&onI)kd*=0.3;
+   const kl=Math.hypot(e.kx,e.ky),nl=Math.max(0,kl-kd*dt);if(nl<=0){e.kx=0;e.ky=0;}else{e.kx*=nl/kl;e.ky*=nl/kl;}}
+  e.x+=vx*dt;e.y+=vy*dt;e.s.bump=false;
+  if(!e.under&&!e.air&&!e.free)for(const k of R.blocks){const cx=clamp(e.x,k.x,k.x+k.w),cy=clamp(e.y,k.y,k.y+k.h);let ddx=e.x-cx,ddy=e.y-cy,dd=Math.hypot(ddx,ddy);if(dd>=e.r)continue;if(dd<0.001){ddx=0;ddy=k.boss?1:-1;dd=1;}e.x=cx+ddx/dd*e.r;e.y=cy+ddy/dd*e.r;e.s.bump=true;
+   if(e.frz>0&&Math.hypot(e.kx,e.ky)>150){if(frzBreaks(e)){shatter(e);break;}const nx=ddx/dd,ny=ddy/dd,dot=e.kx*nx+e.ky*ny;if(dot<0){e.kx-=1.6*dot*nx;e.ky-=1.6*dot*ny;}}}
+  // PAIRS: the runner drags its tank along by the hand
+  if(e.type==='runner'&&e.mate&&!e.mate.dead){const m=e.mate,ddx=m.x-e.x,ddy=m.y-e.y,dd=Math.hypot(ddx,ddy);if(dd>32){const c=dd-32;e.x+=ddx/dd*c*0.55;e.y+=ddy/dd*c*0.55;m.x-=ddx/dd*c*0.45;m.y-=ddy/dd*c*0.45;}}}
+ for(let i=0;i<es.length;i++){const a=es[i];if(a.dead)continue;
+  if(!a.under&&!a.air&&!a.s.on)for(let j=i+1;j<es.length;j++){const c=es[j];if(c.dead||c.under||c.air||c.s.on)continue;const dx=c.x-a.x,dy=c.y-a.y,rr=a.r+c.r,d2=dx*dx+dy*dy;
+   if(d2<rr*rr&&d2>0.0001){const d=Math.sqrt(d2),nx=dx/d,ny=dy/d;
+    const sa=a.frz>0?Math.hypot(a.kx,a.ky):0,sb=c.frz>0?Math.hypot(c.kx,c.ky):0;
+    if(sa>200||sb>200){if(sa>=sb)pinHit(a,c,sa,nx,ny);else pinHit(c,a,sb,-nx,-ny);}
+    // heavy bodies (bosses, nests) do not get pushed; the other one moves all the way
+    const wa=a.free||!a.kbm?0:c.free||!c.kbm?1:0.5,wc=1-wa;if(a.free&&c.free)continue;const push=Math.min(rr-d,120*dt);a.x-=nx*push*wa;a.y-=ny*push*wa;c.x+=nx*push*wc;c.y+=ny*push*wc;}}
+  if(a.dead||a.free||a.s.on)continue;
+  // the walls, or through a wrap hole to the other side
+  let side=-1;const inH=R.holes.length>0;
+  if(a.x<a.r){if(inH&&holeAt(0,a.y)){if(a.x<0)a.x+=W;}else{a.x=a.r;side=0;}}else if(a.x>W-a.r){if(inH&&holeAt(1,a.y)){if(a.x>W)a.x-=W;}else{a.x=W-a.r;side=1;}}
+  if(a.y<a.r){if(inH&&holeAt(2,a.x)){if(a.y<0)a.y+=AH;}else{a.y=a.r;if(side<0)side=2;}}else if(a.y>AH-a.r){if(inH&&holeAt(3,a.x)){if(a.y>AH)a.y-=AH;}else{a.y=AH-a.r;if(side<0)side=3;}}
+  a.wallSide=side;
+  if(side>=0){const ks=Math.hypot(a.kx,a.ky);
+   if(a.frz>0&&ks>150){if(frzBreaks(a))shatter(a);else if(side<2)a.kx*=-0.5;else a.ky*=-0.5;}
+   else if(ks>(C.heavy>=3?200:C.thorns?250:SPLAT_V))splat(a,side);}
+  if(TL&&!a.dead){const t=TL.side,on=t===0?a.x<=a.r+1:t===1?a.x>=W-a.r-1:t===2?a.y<=a.r+1:a.y>=AH-a.r-1;if(on)tiltWall(a,TL);}}
+ for(let i=es.length-1;i>=0;i--)if(es[i].dead)es.splice(i,1);}
+
+// ================= boss controllers =================
+function bossStep(dt){const bs=R.boss;if(!bs||R.phase!=='boss')return;
+ if(!bs.active){bs.t+=dt;for(const p of bs.parts)p.shell=true;
+  if(bs.key==='wall')wallBossStep(bs,dt);
+  if(bs.t>1.5){bs.active=true;bs.t=0;for(const p of bs.parts){p.shell=bs.key==='knight'||bs.key==='jugg';p.free=false;}shake(6,0,1);sfx.thud();}
+  return;}
+ if(fxOn('TimeStop'))return;bs.t+=dt;
+ // phase 2 at half health (the Twin Kings instead rage when one king falls)
+ if(bs.phase===1&&bs.key!=='kings'&&bossFrac()<=0.5){bs.phase=2;pop(PHASE2[bs.key],180,96,'#ff6b6b',18,1.4);shake(5,0,1);sfx.roar();}
+ if(bs.key==='wall')wallBossStep(bs,dt);
+ if(bs.key==='kings'&&bs.rev){bs.rev.t-=dt;if(bs.rev.t<=0){const rv=bs.rev;bs.rev=null;const e=bpart('king',rv.x,rv.y,{ec:rv.ec});e.maxHp=rv.maxHp;e.hp=Math.ceil(rv.maxHp/2);e.s={};R.rings.push({x:e.x,y:e.y,r:50,t:0,life:0.5,col:colOf(e.ec)});pop('THE KING RETURNS',180,96,'#ffd23f',18,1.4);sfx.roar();}}}
+// THE WALL: a block that slides down toward you, following your ball sideways, then slams back up. Only its back (the top face) can be hurt.
+function wallBossStep(bs,dt){const k=bs.wall,b=R.ball,p2=bs.phase===2;if(!bs.active){k.y=Math.min(50,k.y+70*dt);return;}
+ if(bs.hitT>0)bs.hitT-=dt;if(bs.armorT>0)bs.armorT-=dt;
+ bs.colT-=dt;if(bs.colT<=0){bs.colT=6;bs.col=other(bs.col);sfx.click(2);}
+ const SL=fxOn('Slowdown')?1/3:1,oy=k.y;
+ if(bs.st==='down'){k.y+=(p2?24:16)*SL*dt;const tx=clamp(b.x-k.w/2,24,W-24-k.w),mx=(p2?70:50)*SL*dt;k.x+=clamp(tx-k.x,-mx,mx);if(k.y+k.h>=AH-100){bs.st='up';shake(5,0,-1);sfx.stomp();}}
+ else{k.y-=220*dt;if(k.y<=50){k.y=50;bs.st='down';shake(4,0,1);sfx.thud();}}
+ // the front of the wall pushes the ball; a resting ball it runs into takes a hit
+ const cx=clamp(b.x,k.x,k.x+k.w),cy=clamp(b.y,k.y,k.y+k.h),dx=b.x-cx,dy=b.y-cy,dd=Math.hypot(dx,dy);
+ if(dd<b.r){if(dd<0.001||(b.y>k.y+k.h/2&&Math.abs(dx)<0.001)){b.y=k.y+k.h+b.r;if(!b.hot&&k.y>oy&&b.inv<=0)hurtBall(null,0,1);}else{b.x=cx+dx/dd*b.r;b.y=cy+dy/dd*b.r;}}}
+// a ball bounces off the top of THE WALL: damage if its colour matches the weak spot and it bounced off something first (so it is a real bank)
+function wallHit(b){const bs=R.boss;if(!bs||!bs.wall||!bs.active||bs.hp<=0||R.phase!=='boss')return;const c=colourNow(b),main=b===R.ball;
+ if(bs.hitF!==R.flicks){bs.hitF=R.flicks;bs.hitN=0;}if(bs.hitN>=2){sfx.thunk();return;}
+ if((b.bounces||0)<2){bs.armorT=0.12;sfx.clank();if(main&&!(R.hintT>0)){R.hintT=1.5;pop('BOUNCE OFF A WALL FIRST',clamp(b.x,90,W-90),hintY(b.y-26,b.y+30),'#ffd23f',13,1.2);}return;}
+ if(!(c==='w'||c===bs.col||(fxOn('Paint')&&R.fx.Paint.c===c))){bs.armorT=0.12;if(main&&!(R.hintT>0)){R.hintT=1.5;pop(bs.col==='b'?'NEEDS A SHORT PULL':'NEEDS A FULL PULL',clamp(b.x,90,W-90),clamp(b.y-26,64,AH-20),colOf(bs.col),13,1.2);}sfx.clank();return;}
+ let dmg=tierDmg(b.chain)+1+(main?C.dmgB+(b.snow||0):0);if(b.heavy&&Math.hypot(b.vx,b.vy)<CRUSH_V)dmg+=CRUSH;if(fxOn('BankBonus'))dmg*=3;if(fxOn('TimeStop')&&upL('TimeStop')>=3)dmg*=2;
+ bs.hitN++;damageWall(dmg,b.x,b.y,true,b);sfx.bank();}
+function damageWall(dmg,x,y,gold,by){const bs=R.boss;if(!bs||!bs.wall||bs.hp<=0)return;bs.hp-=dmg;bs.hitT=0.12;R.score+=15*dmg*Math.max(1,(by||R.ball).chain||0)*(fxOn('Gold')?2:1);
+ farPop(''+dmg,x,y,6,x,y+20,gold?'#ffd23f':'#fff',gold?20:16);R.freeze=Math.max(R.freeze,0.07);shake(4,0,0);sfx.kill();if(bs.hp<=0){bs.hp=0;bossDie();}}
+// a blast that reaches over the top of THE WALL hurts it in the right colour
+function hurtWallIn(x,y,r,d,c){const bs=R.boss;if(!bs||!bs.wall||!bs.active||bs.hp<=0)return;const k=bs.wall;if(y>k.y+4||x<k.x-r||x>k.x+k.w+r||k.y-y>r)return;if(c==='w'||c===bs.col)damageWall(d,clamp(x,k.x,k.x+k.w),k.y,true);else bs.armorT=0.12;}
+
+// ================= shots, marks and the floor =================
+// enemy shots only hurt a resting ball. A moving ball sends them back, and a sent-back shot hurts the first enemy it meets.
+function shotsStep(dt){if(!R.shots.length)return;const b=R.ball,TS=fxOn('TimeStop');
+ for(const s of R.shots){if(TS&&!s.refl)continue;s.t+=dt;s.x+=s.vx*dt;s.y+=s.vy*dt;
+  if(s.x<s.r||s.x>W-s.r||s.y<s.r||s.y>AH-s.r||s.t>s.life||R.blocks.some(k=>s.x>k.x-s.r&&s.x<k.x+k.w+s.r&&s.y>k.y-s.r&&s.y<k.y+k.h+s.r)){s.dead=true;puff(s.x,s.y);continue;}
+  if(s.refl){for(const e of R.enemies){if(e.dead||e.air||e.under)continue;if(Math.hypot(e.x-s.x,e.y-s.y)<e.r+s.r){hurt(e,1,'w','shot',s.x,s.y,'#fff',15);s.dead=true;break;}}continue;}
+  const d=Math.hypot(b.x-s.x,b.y-s.y);if(d>=b.r+s.r)continue;const nx=(s.x-b.x)/(d||1),ny=(s.y-b.y)/(d||1);
+  if(b.hot){s.refl=true;const sp=Math.max(300,Math.hypot(s.vx,s.vy)*2);s.vx=nx*sp;s.vy=ny*sp;s.t=0;s.life=2;sfx.clank();pop('RETURNED',s.x,s.y-16,'#d9e2ff',12,0.4);}
+  else if(b.inv<=0&&R.phase!=='dead'&&R.phase!=='bossdead'){hurtBall(null,-nx,-ny);s.dead=true;}}
+ R.shots=R.shots.filter(s=>!s.dead);}
+// marks: a mortar shell or a paint splash on its way down. The circle shows where it lands.
+function marksStep(dt){if(!R.marks.length)return;if(fxOn('TimeStop'))return;const b=R.ball;
+ for(const m of R.marks){m.t+=dt;if(m.t<m.T)continue;m.done=true;
+  if(m.kind==='mortar'){R.rings.push({x:m.x,y:m.y,r:m.r,t:0,life:0.3,col:'#ff8a5c'});burst(m.x,m.y,'#ff8a5c',6);sfx.boom();shake(4,0,0);const d=Math.hypot(b.x-m.x,b.y-m.y);if(!b.hot&&d<m.r+b.r*0.5)hurtBall(null,(b.x-m.x)/(d||1),(b.y-m.y)/(d||1));}
+  else if(m.kind==='paint'){R.patches.push({x:m.x,y:m.y,r:m.r,c:m.c,t:0,life:9});sfx.splat();}}
+ R.marks=R.marks.filter(m=>!m.done);}
+function groundStep(dt){if(R.slime.length){for(const s of R.slime)s.t+=dt;R.slime=R.slime.filter(s=>s.t<s.life);}if(R.patches.length){for(const p of R.patches)p.t+=dt;R.patches=R.patches.filter(p=>p.t<p.life);}}
+const onSlime=(x,y)=>{for(const s of R.slime)if(Math.hypot(x-s.x,y-s.y)<s.r)return s;return null;};
+const onPatch=(x,y)=>{for(const p of R.patches)if(Math.hypot(x-p.x,y-p.y)<p.r)return p;return null;};
+// SLIDING WALLS move side to side; built blocks grow in
+function blocksStep(dt){for(const k of R.blocks){if(k.built&&k.t<1)k.t+=dt*2.5;if(k.mv){k.x+=k.mv.spd*dt*(fxOn('Slowdown')?1/3:1);if(k.x<k.mv.a){k.x=k.mv.a;k.mv.spd=Math.abs(k.mv.spd);}if(k.x>k.mv.b){k.x=k.mv.b;k.mv.spd=-Math.abs(k.mv.spd);}}}}
+// bombers and Explosive elites go off a moment after they die, hurting every enemy close by (any colour)
+function boomsStep(dt){if(!R.booms.length)return;for(const q of R.booms)q.t-=dt;const go=R.booms.filter(q=>q.t<=0);if(!go.length)return;R.booms=R.booms.filter(q=>q.t>0);
+ for(const q of go){R.rings.push({x:q.x,y:q.y,r:q.r,t:0,life:0.3,col:'#ffb13b'});R.rings.push({x:q.x,y:q.y,r:q.r*0.5,t:0,life:0.2,col:'#ffffff'});burst(q.x,q.y,'#ffb13b',10);sfx.boom();shake(6,0,0);vib(25);
+  for(const e of R.enemies){if(e.dead||e.under)continue;const dx=e.x-q.x,dy=e.y-q.y,dd=Math.hypot(dx,dy)||1;if(dd<q.r+e.r){knock(e,dx/dd,dy/dd,380,'w');hurt(e,2,'w','boom',q.x,q.y,'#ffb13b',17);}}
+  hurtWallIn(q.x,q.y,q.r,2,'w');}}
+function stompsStep(dt){if(fxOn('TimeStop'))return;const b=R.ball;for(const s of R.stomps){s.r+=320*dt;if(!s.hit&&!b.hot&&b.inv<=0){const d=Math.hypot(b.x-s.x,b.y-s.y);if(Math.abs(d-s.r)<b.r+5){s.hit=true;const nx=d>0?(b.x-s.x)/d:1,ny=d>0?(b.y-s.y)/d:0;hurtBall(null,nx,ny);}}}
+ R.stomps=R.stomps.filter(s=>s.r<720);}
+// fire: an enemy of the fire's colour standing in it takes 1 every 0.5 s (white fire burns anything)
+function firesStep(dt){if(!R.fires.length)return;for(const f of R.fires)f.t+=dt;R.fires=R.fires.filter(f=>f.t<f.life);
+ for(const e of R.enemies){if(e.dead||e.fireCd>0||e.under||e.air)continue;for(const f of R.fires){if(matches(f.c,e)&&Math.hypot(e.x-f.x,e.y-f.y)<f.r+e.r*0.6){e.fireCd=0.5;damageEnemy(e,1,'fire',e.x,e.y+1,'#ffb13b',14);break;}}}
+}
+// POWDER KEGS: the game drops kegs on open floor. Any hot ball sets one off in its colour.
+function spawnKeg(){const b=R.ball;for(let i=0;i<30;i++){const x=45+Math.random()*(W-90),y=55+Math.random()*(AH-110);
+  if(Math.hypot(x-b.x,y-b.y)<110)continue;if(R.bumpers.some(bu=>Math.hypot(x-bu.x,y-bu.y)<45))continue;if(R.enemies.some(e=>!e.dead&&Math.hypot(x-e.x,y-e.y)<e.r+24))continue;if(R.blocks.some(k=>x>k.x-40&&x<k.x+k.w+40&&y>k.y-40&&y<k.y+k.h+40))continue;if(R.kegs.some(k=>Math.hypot(x-k.x,y-k.y)<70))continue;if(R.pickups.some(q=>Math.hypot(x-q.x,y-q.y)<40))continue;
+  R.kegs.push({x,y,r:13,lit:0,t:0,dead:false,c:'w'});puff(x,y);return;}}
+function blowKeg(k,c){if(k.dead)return;k.dead=true;const r=C.kegR,d=C.kegD;R.rings.push({x:k.x,y:k.y,r,t:0,life:0.25,col:colOf(c)});R.rings.push({x:k.x,y:k.y,r:r*0.5,t:0,life:0.18,col:'#ffb13b'});burst(k.x,k.y,'#c27a3a',8);R.freeze=Math.max(R.freeze,0.06);shake(6,0,0);sfx.boom();vib(30);
+ for(const e of R.enemies){if(e.dead||e.under)continue;const dx=e.x-k.x,dy=e.y-k.y,dd=Math.hypot(dx,dy)||1;if(dd<r+e.r){knock(e,dx/dd,dy/dd,380,c);hurt(e,d,c,'keg',k.x,k.y,'#ffb13b',18);}}
+ hurtWallIn(k.x,k.y,r,d,c);
+ if(C.kegChain)for(const o of R.kegs){if(!o.dead&&!(o.lit>0)&&Math.hypot(o.x-k.x,o.y-k.y)<r+40){o.lit=0.14;o.c=c;}}
+ if(hasCombo('NAPALM'))addFire(k.x,k.y,60,2.5,'w');
+ if(hasCombo('SHRAPNEL'))spawnBurst(k.x,k.y,4,800,0.6,c);
+ R.kegT=Math.max(R.kegT,2.5);}
+function kegsStep(dt){const b=R.ball;
+ if(C.kegs&&(R.phase==='wave'||R.phase==='boss')){R.kegT-=dt;if(R.kegT<=0&&R.kegs.filter(k=>!k.dead).length<C.kegs){spawnKeg();R.kegT=2;}}
+ for(const k of R.kegs){if(k.dead)continue;k.t+=dt;
+  if(k.lit>0){k.lit-=dt;if(k.lit<=0){blowKeg(k,k.c||'w');continue;}}
+  for(const bb of [b,R.twin.b]){if(!bb||!bb.hot)continue;if(Math.hypot(bb.x-k.x,bb.y-k.y)<bb.r+k.r){if(bb===b){b.chain++;chainBump(b);}pop('KEG!',k.x,k.y-24,'#ffb13b',18,0.5);blowKeg(k,colourNow(bb));break;}}
+  if(k.dead||b.hot)continue;const dx=b.x-k.x,dy=b.y-k.y,d=Math.hypot(dx,dy);if(d<b.r+k.r){const nx=d>0?dx/d:1,ny=d>0?dy/d:0;b.x=k.x+nx*(b.r+k.r);b.y=k.y+ny*(b.r+k.r);}}
+ if(R.kegs.some(k=>k.dead))R.kegs=R.kegs.filter(k=>!k.dead);}
+function fxStep(dt){
+ for(const c of R.chunks){c.t+=dt;if(c.t<0.6){c.x+=c.vx*dt;c.y+=c.vy*dt;if(c.x<c.r){c.x=c.r;c.vx*=-0.6;}if(c.x>W-c.r){c.x=W-c.r;c.vx*=-0.6;}if(c.y<c.r){c.y=c.r;c.vy*=-0.6;}if(c.y>AH-c.r){c.y=AH-c.r;c.vy*=-0.6;}c.vx*=0.96;c.vy*=0.96;}}
+ if(R.chunks.length&&R.chunks[0].t>=3)R.chunks=R.chunks.filter(c=>c.t<3);
+ for(const p of R.parts){p.t+=dt;p.x+=p.vx*dt;p.y+=p.vy*dt;p.vx*=0.95;p.vy*=0.95;}R.parts=R.parts.filter(p=>p.t<p.life);
+ for(const p of R.pops){p.t+=dt;p.y-=22*dt;}R.pops=R.pops.filter(p=>p.t<p.life);
+ for(const r of R.rings)r.t+=dt;R.rings=R.rings.filter(r=>r.t<r.life);
+ for(const bo of R.bolts)bo.t+=dt;if(R.bolts.length)R.bolts=R.bolts.filter(bo=>bo.t<bo.life);
+ for(const k in R.fx){const f=R.fx[k];if(f.t>0)f.t-=dt;}
+ for(const bu of R.bumpers){if(bu.hitT>0)bu.hitT-=dt;if(bu.zapT>0)bu.zapT-=dt;}
+ if(R.intro>0){R.intro-=dt;if(R.intro<=0){shake(4,0,1);sfx.thud();puff(R.ball.x,R.ball.y+10);}}}
+function endWave(){R.phase='gatewait';R.gateT=0.6;R.fires.length=0;for(const e of R.enemies)if(!e.dead)burst(e.x,e.y,colOf(e.ec==='t'?'w':e.ec),6);R.enemies.length=0;R.pending.length=0;R.minis.length=0;R.pickups.length=0;R.dq.length=0;R.fx={};R.tilt=null;R.twin.b=null;R.shots.length=0;R.marks.length=0;R.ball.leech=null;R.forceEc=null;
+ if(R.wv&&R.wv.k==='first2'&&!R.practice&&!META.tut){META.tut=true;save();}
+ R.clearTitle=(loopRoom()||(R.wv&&R.wv.k==='test')?'':'WAVE '+R.wave+' ')+'CLEAR';pop(R.clearTitle,180,200,'#fff',30,1.0);sfx.clear();shake(3,0,0);vib(1,'ok');}
+function step(dt){R.gt+=dt;const TS=fxOn('TimeStop');
+ if(R.phase==='wave'&&!TS)waveSpawn(dt);
+ if(!TS){pendingStep(dt);blocksStep(dt);}
+ ballStep(dt);twinStep(dt);kegsStep(dt);minisStep(dt);enemiesStep(dt);firesStep(dt);dominoStep(dt);boomsStep(dt);shotsStep(dt);marksStep(dt);groundStep(dt);puTick(dt);bossStep(dt);stompsStep(dt);fxStep(dt);
+ if(R.hintT>0)R.hintT-=dt;
+ if(R.trick&&R.phase==='wave')trickStep();
+ if(R.wv&&R.wv.flip&&!R.flipDone&&R.phase==='wave'&&R.kills>=Math.ceil(R.total/2))doFlip();
+ if(R.phase==='wave'&&waveDone())endWave();
+ if(R.phase==='gatewait'){R.gateT-=dt;if(R.gateT<=0){if(loopRoom())advance();else openGate();}}
+ // a level-up mid-fight is saved for the screen after the wave (in the boss fight, the last stage, it only scores)
+ while(R.score>=R.nextLvl){R.level++;R.nextLvl=lvlNeed(R.level);sfx.bell(false);if(R.inBoss||loopRoom())pop('LEVEL '+R.level+'!',180,R.inBoss?112:60,'#ffd23f',18,1.2);else{R.lvlDue++;pop('LEVEL '+R.level+'! +1 PICK AFTER THE WAVE',180,60,'#ffd23f',14,1.6);}}}
+function decayFx(rdt){const s=R.shake;if(s.t>0)s.t-=rdt;if(R.flash>0)R.flash-=rdt;for(let i=0;i<4;i++)if(R.wflash[i]>0)R.wflash[i]-=rdt;const b=R.ball;if(b.punch>0)b.punch-=rdt;if(b.chainPop>0)b.chainPop-=rdt;if(b.hot)b.coldT=0;else b.coldT+=rdt;}
+
+// ================= gates =================
+function famCount(f){let n=0;for(const k in R.upg)if(famOf(k)===f)n++;return n;}
+// a card can be offered unless it is maxed or banished, or it is a new terrain / power-up kind and you already have 3
+function canOffer(k){const l=R.upg[k]||0;if(l>=3||R.banned.includes(k)||!cardOn(k))return false;const f=famOf(k);return !!(l||!CAP[f]||famCount(f)<CAP[f]);}
+// any three cards. From the 2nd pick on, one card is often one that switches on a combo.
+function makeOffer(exclude){const avail=CARD_KEYS.filter(k=>canOffer(k)&&!exclude.includes(k));
+ for(let i=avail.length-1;i>0;i--){const j=Math.floor(rnd()*(i+1));[avail[i],avail[j]]=[avail[j],avail[i]];}
+ const pick=[];if(R.locked&&avail.includes(R.locked))pick.push(R.locked);
+ const cmb=avail.filter(k=>combosFor(k).length&&!pick.includes(k));if(R.picks>=1&&cmb.length&&rnd()<0.6)pick.push(cmb[0]);
+ for(const k of avail){if(pick.length>=3)break;if(!pick.includes(k))pick.push(k);}
+ return pick.sort((a,b)=>FAM_ORDER[famOf(a)]-FAM_ORDER[famOf(b)]);}
+// the one screen between waves. Picks owed = 1 + level-ups + rewards (Golden, trick shot). Each pick is a card or healing; the cards refresh in place.
+// taps on the screen are ignored for GATE_GUARD s after it opens, so a tap meant for aiming cannot pick a card unread
+const GATE_GUARD=0.8;
+function openGate(){R.gateKind='wave';scr='gate';scrT=0;gateAnim=0;R.gateN++;P.aim=false;buffered=null;
+ R.picksOwed=1+R.lvlDue+R.freeDue;R.pickN=0;R.gateLvl=R.lvlDue;R.lvlDue=0;R.freeDue=0;
+ const t=lvR('tools');if(t>=1)R.reroll=Math.max(R.reroll,1);R.banishes=t>=2?1:0;R.locks=t>=3?1:0;R.gateMode=null;R.lockedShown=R.locked;reseed(300+R.gateN*10);R.offer=makeOffer([]);R.locked=null;R.sel=null;saveRun('gate');}
+// one pick used: refresh the cards (with a short guard so a double tap does not pick blind), or go on when none are left
+function usePick(){R.picksOwed--;R.pickN++;R.sel=null;if(R.picksOwed>0){reseed(300+R.gateN*10+R.pickN);R.offer=makeOffer([]);R.lockedShown=null;R.gateMode=null;gateAnim=0.1;scrT=Math.min(scrT,GATE_GUARD-0.35);saveRun('gate');return;}R.rewards=[];nextStage();}
+function doReroll(){if(!R.reroll)return;R.reroll--;R.sel=null;R.offer=makeOffer(R.offer);saveRun('gate');R.lockedShown=null;gateAnim=0;sfx.pick();}
+function setGateMode(m){if(m==='banish'&&!R.banishes)return;if(m==='lock'&&!R.locks)return;R.sel=null;R.gateMode=R.gateMode===m?null:m;sfx.click(2);}
+function pickCard(i){const nm=R.offer[i];if(!nm)return;
+ if(R.gateMode==='banish'){R.banishes--;R.gateMode=null;R.banned.push(nm);const alt=makeOffer(R.offer).find(k=>!R.offer.includes(k));if(alt)R.offer[i]=alt;else R.offer.splice(i,1);if(R.lockedShown===nm)R.lockedShown=null;sfx.cancel();vib(10);return;}
+ if(R.gateMode==='lock'){R.locks--;R.gateMode=null;R.locked=nm;R.lockedShown=nm;sfx.click(3);vib(10);return;}
+ const cbs=combosFor(nm),was=R.upg[nm]||0,lvl=was+1;R.upg[nm]=lvl;R.picks++;recalc();
+ if(nm==='Shield')R.ball.shield=C.shieldMax;
+ if(famOf(nm)==='POWER'&&!was)R.pu[nm].t=2.5;
+ sfx.pick();vib(10);
+ if(cbs.length){pop('COMBO: '+cbs.map(c=>c.name).join(' + '),180,246,'#ffd23f',cbs.length>1?18:26,2.2);popWrap(cbs[0].d,180,278,'#fff3c0',14,2.4);sfx.bell(true);}
+ usePick();}
+// HEAL uses a pick: +2 hearts, or +1 max heart when full. At heat 4+ there is no healing: the button skips the pick.
+const healCap=()=>7+lvR('hearts'),canHeal=()=>R.heat>=4||R.hearts<R.maxH||R.maxH<healCap();
+function patchUp(){if(scr!=='gate')return;if(!canHeal()){if(!R.offer.length){sfx.click(1);usePick();return;}sfx.cancel();return;}if(R.heat>=4){sfx.click(1);usePick();return;}if(R.hearts<R.maxH)R.hearts=Math.min(R.maxH,R.hearts+2);else{R.maxH++;R.hearts=R.maxH;}sfx.pick();vib(10);usePick();}
+function nextStage(){scr='play';scrT=0;paused=false;saveRun('wave');advance();}
+// a tap on the card screen: the first tap on a card (or HEAL) chooses it, a second tap on the same one takes it.
+// Banish and lock act on the first tap. Keys 1-4 still take a card at once.
+function gateTap(i){if(i<3&&R.gateMode){pickCard(i);return;}
+ if(i===3&&!canHeal()&&R.offer.length){sfx.cancel();return;}
+ if(R.sel===i){R.sel=null;if(i===3)patchUp();else pickCard(i);return;}
+ R.sel=i;sfx.click(2);vib(6);}
+// rank: time against par (about 22 s a wave and 50 s a boss) and best chain
+function rankOf(time,chain,cleared,atBoss){if(!cleared)return atBoss?'D':'E';const nw=totalWaves(),nb=R.plan.filter(s=>s.k==='boss').length,par=22*nw+50*nb;
+ const tg=time<=par?0:time<=par*1.2?1:time<=par*1.5?2:3,cg=chain>=10?0:chain>=8?1:chain>=6?2:3;return 'SABC'[Math.max(tg,cg)];}
+// rank uses game time (R.gt: simulated seconds; slow-mo, hit-stop and pause do not count). Practice runs give no XP and set no bests.
+function finishRun(){const dead=R.phase==='dead';if(dead)R.clearTime=R.gt;R.nb={};
+ R.rank=rankOf(R.clearTime,R.bestChain,!dead,R.inBoss);
+ if(R.practice){R.xpGain=0;}
+ else{BEST.runs++;
+  if(!dead&&(BEST.time===0||R.clearTime<BEST.time)){R.nb.time=true;BEST.time=R.clearTime;}if(R.bestChain>BEST.chain){R.nb.chain=true;BEST.chain=R.bestChain;}if(R.score>BEST.score){R.nb.score=true;BEST.score=R.score;}
+  R.xpGain=Math.round(R.score/10*heatMult(R.heat))+(dead?0:50);META.xp+=R.xpGain;META.earned+=R.xpGain;META.runs++;
+  if(R.daily){const t=todayKey();if(R.daily.day===t){const d=META.daily&&META.daily.day===t?META.daily:{day:t,best:0,tries:0};d.tries++;if(R.score>d.best){d.best=R.score;R.nb.daily=true;}META.daily=d;}}
+  const bk=R.plan.find(s=>s.k==='boss');if(bk&&!R.daily)META.lastBoss=bk.key;
+  if(!dead&&!R.daily&&R.heat===META.heatMax&&META.heatMax<HEAT_MAX){META.heatMax++;R.newHeat=true;}
+  if(!R.daily&&META.cardsN<CARD_UNLOCK.length){R.newCard=CARD_UNLOCK[META.cardsN];META.cardsN++;}
+  if(!R.daily&&(R.inBoss||!dead))META.newOk=true;
+  clearRun();}
+ save();scr=dead?'over':'clear';scrT=0;P.aim=false;buffered=null;R.pops.length=0;}
+// practice screen: tap a card to raise its level; a 4th tap takes it off. The caps hold here too.
+function labTap(k){const l=LAB[k]||0;if(!l&&!labRoom(k)){labMsg='You can have 3 '+(famOf(k)==='POWER'?'power-ups':'terrain kinds')+'. Tap one to take it off first.';labMsgT=2.6;sfx.cancel();return;}
+ if(l>=3)delete LAB[k];else LAB[k]=l+1;save();sfx.click(LAB[k]||0);}
+
+// ================= update =================
+// aim slow motion lasts as long as you hold the pull, in every run (the workshop makes it slower, not longer)
+const slowFree=()=>true;
+let lastT=(typeof performance!=='undefined'?performance.now():0);
+function update(rdt){scrT+=rdt;if(labMsgT>0)labMsgT-=rdt;
+ if(scr==='title'){const tb=titleBall;wallStep(tb,rdt,1,0,null);tb.trail.push({x:tb.x,y:tb.y});if(tb.trail.length>14)tb.trail.shift();return;}
+ if(scr==='gate'){gateAnim+=rdt;return;}
+ if(scr!=='play'||!R||paused)return;
+ if(R.freeze>0){R.freeze-=rdt;decayFx(rdt);return;}
+ let ts=1;if(P.aim){P.hold+=rdt;ts=P.hold<C.slowT||slowFree()?C.slowK:Math.min(1,C.slowK+(1-C.slowK)*(P.hold-C.slowT)/0.5);}
+ if(R.slowT>0){R.slowT-=rdt;ts*=0.3;}
+ if(R.phase==='dead')ts=0.3;if(R.phase==='bossdead')ts=0.15;R.ts=ts;
+ R.acc=Math.min(0.1,R.acc+rdt*ts);
+ while(R.acc>=STEP){R.acc-=STEP;step(STEP);if(R.freeze>0||scr!=='play')break;}
+ decayFx(rdt);
+ if(R.phase==='dead'||R.phase==='bossdead'){R.endT-=rdt;if(R.endT<=0){if(R.phase==='bossdead')afterBoss();else finishRun();}}}
+
+// ================= drawing helpers =================
+// nothing on any screen is drawn under MIN_TXT px
+const MIN_TXT=11;
+function txt(s,x,y,size,col,align,weight){size=Math.max(MIN_TXT,size);ctx.font=(weight||600)+' '+size+'px '+FONT;ctx.textAlign=align||'center';ctx.textBaseline='middle';ctx.fillStyle=col||'#fff';ctx.fillText(s,x,y);}
+// txt, shrunk until it fits in maxW
+function fitTxt(s,x,y,maxW,size,col,align,weight){let sz=size;ctx.font=(weight||600)+' '+sz+'px '+FONT;while(sz>MIN_TXT&&ctx.measureText(s).width>maxW){sz-=0.5;ctx.font=(weight||600)+' '+sz+'px '+FONT;}txt(s,x,y,sz,col,align,weight);}
+function rrect(x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.lineTo(x+w-r,y);ctx.quadraticCurveTo(x+w,y,x+w,y+r);ctx.lineTo(x+w,y+h-r);ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);ctx.lineTo(x+r,y+h);ctx.quadraticCurveTo(x,y+h,x,y+h-r);ctx.lineTo(x,y+r);ctx.quadraticCurveTo(x,y,x+r,y);ctx.closePath();}
+function wrap(s,maxW,size){ctx.font='500 '+size+'px '+FONT;const words=s.split(' '),lines=[];let cur='';for(const w of words){const t=cur?cur+' '+w:w;if(ctx.measureText(t).width>maxW&&cur){lines.push(cur);cur=w;}else cur=t;}if(cur)lines.push(cur);return lines;}
+function button(x,y,w,h,label,col,fn,size){rrect(x,y,w,h,10);ctx.fillStyle='#1b2030';ctx.fill();ctx.lineWidth=2;ctx.strokeStyle=col;ctx.stroke();txt(label,x+w/2,y+h/2,size||16,'#fff','center',700);UI.push({x,y,w,h,fn});}
+function circ(x,y,r,fill,stroke,lw){ctx.beginPath();ctx.arc(x,y,r,0,TAU);if(fill){ctx.fillStyle=fill;ctx.fill();}if(stroke){ctx.lineWidth=lw||2;ctx.strokeStyle=stroke;ctx.stroke();}}
+// heart outline path, width s, centred on (x,y)
+function heart(x,y,s){ctx.beginPath();ctx.moveTo(x,y-0.295*s);
+ ctx.bezierCurveTo(x,y-0.323*s,x-0.045*s,y-0.432*s,x-0.227*s,y-0.432*s);ctx.bezierCurveTo(x-0.5*s,y-0.432*s,x-0.5*s,y-0.091*s,x-0.5*s,y-0.091*s);
+ ctx.bezierCurveTo(x-0.5*s,y+0.068*s,x-0.318*s,y+0.268*s,x,y+0.432*s);ctx.bezierCurveTo(x+0.318*s,y+0.268*s,x+0.5*s,y+0.068*s,x+0.5*s,y-0.091*s);
+ ctx.bezierCurveTo(x+0.5*s,y-0.091*s,x+0.5*s,y-0.432*s,x+0.227*s,y-0.432*s);ctx.bezierCurveTo(x+0.045*s,y-0.432*s,x,y-0.323*s,x,y-0.295*s);ctx.closePath();}
+function eyes(x,y,r,tx,ty,col){const a=Math.atan2(ty-y,tx-x);const ex=Math.cos(a)*r*0.35,ey=Math.sin(a)*r*0.35;const px=-Math.sin(a)*r*0.32,py=Math.cos(a)*r*0.32;circ(x+ex+px,y+ey+py,r*0.16,col);circ(x+ex-px,y+ey-py,r*0.16,col);}
+// one small picture per card, drawn at (x,y) about 36 wide (s scales it)
+function drawCardIcon(k,x,y,col,s){ctx.save();ctx.translate(x,y);if(s&&s!==1)ctx.scale(s,s);ctx.strokeStyle=col;ctx.fillStyle=col;ctx.lineWidth=3;ctx.lineCap='round';ctx.lineJoin='round';ctx.beginPath();const D='#1b2030';
+ switch(k){
+ case 'Splitter':ctx.moveTo(-15,11);ctx.lineTo(0,-2);ctx.lineTo(15,11);ctx.moveTo(0,-2);ctx.lineTo(0,-15);ctx.stroke();circ(0,-2,5,col);circ(-15,11,4,col);circ(15,11,4,col);circ(0,-15,4,col);break;
+ case 'Heavy':ctx.lineWidth=4;ctx.arc(0,-7,8,Math.PI*1.05,Math.PI*1.95);ctx.stroke();circ(0,5,12,col);circ(-4,1,3,D);break;
+ case 'Fireball':ctx.moveTo(4,-16);ctx.quadraticCurveTo(16,-2,10,9);ctx.quadraticCurveTo(2,18,-8,10);ctx.quadraticCurveTo(-14,0,-4,-6);ctx.quadraticCurveTo(-2,-10,4,-16);ctx.fill();circ(1,6,5,D);break;
+ case 'Blast':circ(0,0,7,col);for(let i=0;i<8;i++){const a=i*TAU/8;ctx.beginPath();ctx.moveTo(Math.cos(a)*10,Math.sin(a)*10);ctx.lineTo(Math.cos(a)*17,Math.sin(a)*17);ctx.stroke();}break;
+ case 'Shield':ctx.setLineDash([5,4]);circ(0,0,15,null,col,3);ctx.setLineDash([]);circ(0,0,6,col);break;
+ case 'Ghost':ctx.moveTo(-12,14);ctx.lineTo(-12,-2);ctx.arc(0,-2,12,Math.PI,0);ctx.lineTo(12,14);ctx.lineTo(8,10);ctx.lineTo(4,14);ctx.lineTo(0,10);ctx.lineTo(-4,14);ctx.lineTo(-8,10);ctx.closePath();ctx.fill();circ(-4,-2,2.5,D);circ(4,-2,2.5,D);break;
+ case 'Chameleon':circ(-13,0,6,colOf('g'));circ(0,0,6,colOf('b'));circ(13,0,6,'#ffffff');break;
+ case 'Snowball':circ(-12,8,4,col);circ(-3,4,6.5,col);circ(10,-3,10,col);break;
+ case 'Bouncy':ctx.moveTo(-18,10);ctx.lineTo(-9,-10);ctx.lineTo(0,10);ctx.lineTo(9,-10);ctx.lineTo(18,10);ctx.stroke();break;
+ case 'Posts':circ(-13,6,6,null,col,3);circ(13,6,6,null,col,3);circ(0,-8,6,null,col,3);break;
+ case 'Wrap':ctx.moveTo(-17,-16);ctx.lineTo(-17,-6);ctx.moveTo(-17,6);ctx.lineTo(-17,16);ctx.moveTo(17,-16);ctx.lineTo(17,-6);ctx.moveTo(17,6);ctx.lineTo(17,16);ctx.stroke();ctx.beginPath();ctx.moveTo(-11,0);ctx.lineTo(9,0);ctx.moveTo(4,-5);ctx.lineTo(10,0);ctx.lineTo(4,5);ctx.stroke();break;
+ case 'Kegs':rrect(-10,-12,20,24,5);ctx.fill();ctx.fillStyle=D;ctx.fillRect(-10,-5,20,3);ctx.fillRect(-10,3,20,3);break;
+ case 'Thorns':ctx.fillRect(-20,8,40,4);for(let i=0;i<4;i++){const cx=-15+i*10;ctx.beginPath();ctx.moveTo(cx-5,8);ctx.lineTo(cx,-10);ctx.lineTo(cx+5,8);ctx.fill();}break;
+ case 'Ice':ctx.globalAlpha=0.4;ctx.ellipse(0,2,18,11,0,0,TAU);ctx.fill();ctx.globalAlpha=1;ctx.beginPath();ctx.ellipse(0,2,18,11,0,0,TAU);ctx.stroke();ctx.beginPath();ctx.moveTo(-9,0);ctx.lineTo(-3,-4);ctx.moveTo(1,6);ctx.lineTo(8,1);ctx.stroke();break;
+ case 'Bomb':circ(-2,4,11,col);ctx.beginPath();ctx.moveTo(5,-5);ctx.quadraticCurveTo(10,-14,4,-17);ctx.stroke();circ(4,-17,3,'#ffd23f');break;
+ case 'Slowdown':circ(0,0,14,null,col,3);ctx.beginPath();ctx.moveTo(0,0);ctx.lineTo(0,-9);ctx.moveTo(0,0);ctx.lineTo(7,4);ctx.stroke();break;
+ case 'Gold':circ(0,0,14,col);circ(0,0,9,null,D,2);ctx.fillStyle=D;ctx.fillRect(-1.5,-5,3,10);break;
+ case 'TimeStop':circ(0,3,13,null,col,3);ctx.fillRect(-3,-16,6,4);ctx.fillRect(-6,-3,4,12);ctx.fillRect(2,-3,4,12);break;
+ case 'Freeze':for(let i=0;i<3;i++){const a=i*Math.PI/3;ctx.beginPath();ctx.moveTo(-Math.cos(a)*16,-Math.sin(a)*16);ctx.lineTo(Math.cos(a)*16,Math.sin(a)*16);ctx.stroke();}break;
+ case 'Tilt':ctx.moveTo(-18,10);ctx.lineTo(18,-4);ctx.stroke();circ(-6,-2,5,col);ctx.beginPath();ctx.moveTo(-12,-13);ctx.lineTo(-18,-8);ctx.lineTo(-12,-3);ctx.stroke();break;
+ case 'Twin':circ(-8,0,8,colOf('b'));circ(8,0,8,colOf('g'));break;
+ case 'BankBonus':ctx.moveTo(15,-16);ctx.lineTo(15,16);ctx.stroke();ctx.beginPath();ctx.moveTo(-15,12);ctx.lineTo(12,0);ctx.lineTo(-15,-12);ctx.stroke();ctx.beginPath();ctx.moveTo(-15,-12);ctx.lineTo(-8,-12);ctx.moveTo(-15,-12);ctx.lineTo(-12,-6);ctx.stroke();break;
+ case 'Domino':for(let i=0;i<3;i++){ctx.save();ctx.translate(-11+i*11,2);ctx.rotate(-0.35+i*0.18);rrect(-4,-11,8,22,2);ctx.fill();ctx.restore();}break;
+ case 'Paint':ctx.moveTo(-12,-6);ctx.lineTo(12,-6);ctx.lineTo(9,14);ctx.lineTo(-9,14);ctx.closePath();ctx.fill();ctx.beginPath();ctx.arc(0,-6,10,Math.PI,0);ctx.stroke();circ(14,3,3,col);break;
+ case 'Star':for(let i=0;i<10;i++){const a=-Math.PI/2+i*Math.PI/5,r=i%2?7:16;if(i)ctx.lineTo(Math.cos(a)*r,Math.sin(a)*r);else ctx.moveTo(Math.cos(a)*r,Math.sin(a)*r);}ctx.closePath();ctx.fill();break;
+ case 'Multi':circ(0,-8,6,col);circ(-9,7,6,col);circ(9,7,6,col);break;
+ case 'Jar':ctx.moveTo(4,-17);ctx.lineTo(-8,2);ctx.lineTo(1,2);ctx.lineTo(-4,17);ctx.lineTo(9,-3);ctx.lineTo(0,-3);ctx.closePath();ctx.fill();break;
+ }ctx.restore();}
+
+// ================= drawing =================
+function drawShop(){ctx.fillStyle='#10131d';ctx.fillRect(0,0,W,H);
+ txt('WORKSHOP',180,28,24,'#fff','center',900);txt(META.xp+' XP',180,52,14,'#ffd23f','center',800);
+ let y=68;const row=(name,d,pips,pipN,label,col,can,fn)=>{rrect(10,y,340,42,8);ctx.fillStyle='#1b2030';ctx.fill();ctx.lineWidth=1.5;ctx.strokeStyle=can?'#3f7a55':'#2c3450';ctx.stroke();ctx.globalAlpha=can||col==='#3a4262'?1:0.5;
+  txt(name,20,y+13,13,'#fff','left',900);if(pipN)for(let i=0;i<pipN;i++){rrect(150+i*14,y+9,10,8,2);ctx.fillStyle=i<pips?'#ffd23f':'#2c3450';ctx.fill();}
+  txt(d,20,y+30,10.5,'#9aa3bd','left',500);button(272,y+6,70,30,label,col,fn,12);ctx.globalAlpha=1;y+=46;};
+ for(const t of TRACKS){const l=lv(t.k),maxed=l>=t.max,c=maxed?0:COST[l],can=!maxed&&META.xp>=c;row(t.name,t.d,l,t.max,maxed?'MAX':c+' XP',maxed?'#3a4262':can?'#7dffa0':'#55607a',can,()=>buyTrack(t.k));}
+ txt('Every ability is unlocked in this demo.',180,y+12,11,'#7f88a6','center',600);
+ button(100,y+30,160,40,'BACK','#9fd3ff',()=>{scr='title';scrT=0;sfx.click(1);},16);}
+function drawTitle(){
+ ctx.fillStyle='#10131d';ctx.fillRect(0,0,W,H);
+ txt('BANKED!',180,64,44,'#fff','center',900);
+ txt('Pull back and let go. How far you pull picks your colour.',180,98,12.5,'#cfd6ee','center',500);
+ let lx=34;for(const t of ['b','g']){shapePath(t,lx,124,7);ctx.fillStyle=colOf(t);ctx.fill();txt(TIER_NAME[t]+' = '+colName(t),lx+13,124,12,colOf(t),'left',800);lx+=166;}
+ txt('Enemies only die to their own colour.',180,146,12.5,'#cfd6ee','center',500);txt('Clear 4 waves, then beat the boss.',180,162,12.5,'#cfd6ee','center',500);
+ // the three ability families, in their colours
+ const parts=[['BALL',FAM.BALL.col],['  ·  ','#55607a'],['TERRAIN',FAM.TERRAIN.col],['  ·  ','#55607a'],['POWER-UP',FAM.POWER.col]];ctx.font='900 12px '+FONT;let tw=0;for(const p of parts)tw+=ctx.measureText(p[0]).width;let px=180-tw/2;for(const p of parts){txt(p[0],px,184,12,p[1],'left',900);px+=ctx.measureText(p[0]).width;}
+ const pulse=0.8+0.2*Math.sin(scrT*5),sv=SAVED;rrect(40,204,280,60,12);ctx.fillStyle='rgba(255,210,63,'+pulse.toFixed(2)+')';ctx.fill();txt(sv?'CONTINUE':'PLAY',180,234,30,'#10131d','center',900);UI.push({x:40,y:204,w:280,h:60,fn:sv?continueRun:startRun});
+ const nk=nextNew();fitTxt(sv?savedLabel(sv):!META.tut?'First run: learn the two pulls.':nk&&!META.newOk?'Reach a boss to meet the next new enemy.':nk?'This run brings a new enemy: the '+ETYPES[nk].name+'.':'You have met every enemy.',180,282,340,12,'#ffd9a0','center',700);
+ // with a saved run, NEW RUN and DAILY throw it away, so they need a second tap
+ const armed=k=>titleArm.k===k&&scrT-titleArm.t<3,twice=(k,fn)=>()=>{if(sv&&!armed(k)){titleArm={k,t:scrT};sfx.click(1);return;}titleArm={k:'',t:-9};fn();};
+ const today=todayKey(),dd=META.daily&&META.daily.day===today?META.daily:null;
+ let y=300;
+ if(sv){button(40,y,META.tut?136:280,40,armed('new')?'TAP AGAIN':'NEW RUN','#ffd23f',twice('new',startRun),14);if(META.tut)button(184,y,136,40,armed('daily')?'TAP AGAIN':'DAILY RUN','#5ec8ff',twice('daily',startDaily),14);
+  if(armed('new')||armed('daily'))txt('This ends your saved run.',180,y+50,11,'#ff8a5c','center',700);y+=60;}
+ else if(META.tut){button(40,y,280,40,'DAILY RUN · '+(dd?'TODAY\'S BEST '+dd.best:'SAME RUN FOR EVERYONE'),'#5ec8ff',startDaily,14);y+=48;}
+ if(META.heatMax>1){button(40,y,280,40,'HEAT '+META.heat+' of '+META.heatMax+'  ▸','#ff8a5c',()=>{META.heat=META.heat%META.heatMax+1;save();sfx.click(2);},15);
+  fitTxt('Heat '+META.heat+': '+HEAT_RULES[META.heat-1]+(META.heat>2?', plus the rules below':'')+'. XP ×'+heatMult(META.heat).toFixed(1),180,y+52,340,11,'#ff8a5c','center',600);y+=70;}
+ const ready=TRACKS.filter(t=>lv(t.k)<t.max&&META.xp>=COST[lv(t.k)]).length;
+ button(40,y,136,42,'WORKSHOP'+(ready?' ●':''),ready?'#7dffa0':'#55607a',()=>{scr='shop';scrT=0;sfx.click(1);},14);
+ button(184,y,136,42,'SETTINGS','#9fd3ff',()=>{scr='settings';scrT=0;sfx.click(2);},14);
+ txt(META.xp+' XP',108,y+54,11,'#7f88a6','center',700);
+ ctx.fillStyle='#0b0d14';ctx.fillRect(0,AH,W,H-AH);ctx.fillStyle='#262c40';ctx.fillRect(0,AH,W,2);
+ if(BEST.runs>0)txt((BEST.time?'BEST '+fmt1(BEST.time):'NO CLEAR YET')+'  ·  CHAIN '+BEST.chain+'  ·  SCORE '+BEST.score,180,536,13,'#9aa3bd','center',700);
+ txt('ENEMIES MET: '+(2+META.seen.length)+' OF '+(2+NEW_ORDER.length)+'  ·  CARDS: '+(STARTER.length+META.cardsN)+' OF '+CARD_KEYS.length,180,560,12,'#7f88a6','center',700);
+ fitTxt('Demo v11: 14 cards to start, more unlock as you play',180,604,330,11,'#55607a','center',600);}
+let resetArm=-9,titleArm={k:'',t:-9};
+// sound: ON, LOW, OFF
+const soundLabel=()=>!SET.sound?'OFF':SET.vol===1?'LOW':'ON';
+function cycleSound(){if(!SET.sound){SET.sound=true;SET.vol=2;}else if(SET.vol===2)SET.vol=1;else SET.sound=false;}
+function drawSettings(){ctx.fillStyle='#10131d';ctx.fillRect(0,0,W,H);txt('SETTINGS',180,32,26,'#fff','center',900);
+ const rows=[[SET.push?'AIM: PUSH':'AIM: SLINGSHOT','#ff8a5c',()=>{SET.push=!SET.push;}],
+  ['SOUND: '+soundLabel(),'#b48cff',cycleSound],
+  ['VIBRATION: '+(SET.vib?'ON':'OFF'),'#b48cff',()=>{SET.vib=!SET.vib;if(SET.vib)vib(14);}],
+  ['SCREEN SHAKE: '+['OFF','LOW','FULL'][SET.shake],'#5ec8ff',()=>{SET.shake=(SET.shake+2)%3;}],
+  ['FLASHES: '+(SET.fewFlash?'FEWER':'NORMAL'),'#5ec8ff',()=>{SET.fewFlash=!SET.fewFlash;}],
+  ['STRIPES ON BLUE: '+(SET.cb?'ON':'OFF'),'#ffd23f',()=>{SET.cb=!SET.cb;}]];
+ let y=52;for(const r of rows){button(40,y,280,38,r[0],r[1],()=>{r[2]();save();sfx.click(2);},14);y+=43;}
+ wrap('Vibration works in the iPhone app, not in a web browser on iPhone. Stripes help if blue and green look alike to you.',330,11).forEach((l,i)=>txt(l,180,y+4+i*14,11,'#9aa3bd','center',500));
+ y+=40;ctx.fillStyle='#262c40';ctx.fillRect(40,y,280,1);txt('FOR TESTING',180,y+16,12,'#7f88a6','center',900);y+=30;
+ button(40,y,280,38,'PULL DISTANCE: '+SET.pull,'#5ec8ff',()=>{SET.pull=SET.pull===90?120:SET.pull===120?160:90;save();sfx.click(2);},14);y+=44;
+ button(40,y,280,38,'PRACTICE ROOM','#d07cff',()=>{scr='lab';scrT=0;sfx.click(3);},14);y+=44;
+ const armed=scrT-resetArm<3;
+ button(40,y,280,38,armed?'TAP AGAIN: FORGET ENEMIES MET':'REPLAY THE FIRST RUN','#ff6b6b',()=>{if(!(scrT-resetArm<3)){resetArm=scrT;sfx.click(1);return;}resetArm=-9;clearRun();META.tut=false;META.seen=[];META.named=[];META.hints=0;META.runs=0;META.cardsN=0;META.newOk=true;save();sfx.pick();},14);y+=44;
+ txt('Starts over on the first run, the enemy order and the cards. XP stays.',180,y+2,11,'#7f88a6','center',500);
+ button(100,y+22,160,40,'BACK','#9fd3ff',()=>{scr='title';scrT=0;sfx.click(1);},16);}
+// practice: four tabs. ABILITIES sets the cards you start with (they come along on every tab);
+// ENEMIES, WAVES and BOSSES pick one room to play on a loop, or one boss.
+const LAB_TABS=[['abilities','ABILITIES','#d07cff'],['enemies','ENEMIES','#7dffa0'],['waves','WAVES','#ffb13b'],['bosses','BOSSES','#ff8fb8']];
+const LAB_COLS=['mixed','green','blue'];
+function labSet(k,v){LABSEL[k]=v;save();sfx.click(2);}
+function drawLab(){ctx.fillStyle='#10131d';ctx.fillRect(0,0,W,H);txt('PRACTICE',180,18,20,'#fff','center',900);
+ for(let i=0;i<4;i++){const t=LAB_TABS[i],on=LABSEL.tab===t[0],x=6+i*88;rrect(x,32,84,30,8);ctx.fillStyle=on?t[2]:'#171b28';ctx.fill();ctx.lineWidth=on?0:1.5;if(!on){ctx.strokeStyle='#2c3450';ctx.stroke();}
+  fitTxt(t[1],x+42,47,78,11.5,on?'#10131d':t[2],'center',900);UI.push({x,y:32,w:84,h:30,fn:()=>labSet('tab',t[0])});}
+ const tab=LABSEL.tab,nLab=Object.keys(LAB).length;
+ if(tab==='abilities')drawLabAbilities();else if(tab==='enemies')drawLabEnemies();else if(tab==='waves')drawLabWaves();else drawLabBosses();
+ if(labMsgT>0)txt(labMsg,180,508,11,'#ff8a5c','center',700);
+ const pc=LAB_TABS.find(t=>t[0]===tab)[2];
+ rrect(40,520,tab==='abilities'?180:280,50,10);ctx.fillStyle=pc;ctx.fill();txt('PLAY',tab==='abilities'?130:180,545,20,'#10131d','center',900);UI.push({x:40,y:520,w:tab==='abilities'?180:280,h:50,fn:()=>startPractice()});
+ if(tab==='abilities')button(230,520,90,50,'CLEAR','#55607a',()=>{for(const k in LAB)delete LAB[k];save();sfx.cancel();},14);
+ button(100,580,160,40,'BACK','#9fd3ff',()=>{scr='settings';scrT=0;sfx.click(1);},16);
+ txt(tab==='abilities'?'Practice runs give no XP.':'Cards from the ABILITIES tab come along'+(nLab?' ('+nLab+' on)':' (none on)')+'. No XP.',180,630,10,'#55607a','center',600);}
+function drawLabAbilities(){txt('Tap a card to set its level. Tap past 3 to take it off.',180,74,11,'#9aa3bd','center',500);
+ const cw=114;for(let c=0;c<3;c++){const f=['BALL','TERRAIN','POWER'][c],fm=FAM[f],keys=CARD_KEYS.filter(k=>famOf(k)===f),x=4+c*(cw+4);let n=0;for(const k of keys)if(LAB[k])n++;
+  txt(fm.name+(CAP[f]?'  '+n+'/'+CAP[f]:''),x+cw/2,92,11,fm.col,'center',900);
+  let y=102;for(const k of keys){const l=LAB[k]||0;rrect(x,y,cw,25,6);ctx.fillStyle=l?'#26304a':'#171b28';ctx.fill();ctx.lineWidth=l?2:1;ctx.strokeStyle=l?fm.col:'#2c3450';ctx.stroke();
+   txt(CARDS[k].name,x+7,y+9,9.5,l?'#fff':'#9aa3bd','left',800);for(let q=0;q<3;q++){rrect(x+7+q*12,y+16,9,4,1.5);ctx.fillStyle=q<l?'#ffd23f':'#2c3450';ctx.fill();}
+   UI.push({x,y,w:cw,h:25,fn:()=>labTap(k)});y+=28;}}
+ const on=COMBOS.filter(c=>LAB[c.a]&&LAB[c.b]);
+ if(on.length){const ls=wrap('★ COMBOS ON: '+on.map(c=>c.name).join(', '),336,11);ls.slice(0,2).forEach((l,i)=>txt(l,180,476+i*15,11,'#ffd23f','center',800));}
+ else txt(COMBOS.length+' combos to find: two matching cards from different families',180,476,10.5,'#7f88a6','center',600);}
+function drawLabEnemies(){const cw=114,per=Math.ceil(ENEMY_KEYS.length/3);
+ for(let i=0;i<ENEMY_KEYS.length;i++){const k=ENEMY_KEYS[i],T=ETYPES[k],c=Math.floor(i/per),r=i%per,x=4+c*(cw+4),y=70+r*28,on=LABSEL.enemy===k;
+  rrect(x,y,cw,25,6);ctx.fillStyle=on?'#26304a':'#171b28';ctx.fill();ctx.lineWidth=on?2:1;ctx.strokeStyle=on?'#7dffa0':'#2c3450';ctx.stroke();
+  ctx.save();ctx.beginPath();ctx.rect(x+2,y+1,22,23);ctx.clip();drawEnemyIcon(k,x+13,y+12.5,Math.min(7,T.r*0.55),T.ec==='e'?(LABSEL.col==='blue'?'b':'g'):T.ec);ctx.restore();
+  fitTxt(T.name,x+26,y+12.5,cw-30,9.5,on?'#fff':'#9aa3bd','left',800);UI.push({x,y,w:cw,h:25,fn:()=>labSet('enemy',k)});}
+ const T=ETYPES[LABSEL.enemy]||ETYPES.zig;let y=70+per*28+8;
+ txt(T.name,180,y,12,'#7dffa0','center',900);y+=15;
+ for(const l of wrap(T.d,340,11).slice(0,3)){txt(l,180,y,11,'#e6e9f5','center',500);y+=13;}
+ if(LABSEL.twist){for(const l of wrap(TWIST_NAME[LABSEL.twist]+': '+TWISTS[LABSEL.twist],340,10.5).slice(0,2)){txt(l,180,y,10.5,'#ffd23f','center',600);y+=13;}}
+ const tws=[''].concat(TWIST_KEYS),ti=Math.max(0,tws.indexOf(LABSEL.twist));
+ button(6,470,170,40,'TWIST: '+(LABSEL.twist?TWIST_NAME[LABSEL.twist]:'NONE')+' ▸','#ffd23f',()=>labSet('twist',tws[(ti+1)%tws.length]),12);
+ if(T.ec==='e'){const ci=Math.max(0,LAB_COLS.indexOf(LABSEL.col));button(184,470,170,40,'COLOUR: '+LABSEL.col.toUpperCase()+' ▸',LABSEL.col==='blue'?colOf('b'):LABSEL.col==='green'?colOf('g'):'#cfd6ee',()=>labSet('col',LAB_COLS[(ci+1)%3]),12);}
+ else{rrect(184,470,170,40,10);ctx.fillStyle='#151927';ctx.fill();txt('COLOUR: '+(T.ec==='x'?'GREY (ANY)':T.ec==='t'?'TWO-TONE':colName(T.ec)),269,490,11,'#55607a','center',800);}}
+function drawLabWaves(){const cw=172,rows=Math.ceil(WAVES.length/2);
+ for(let i=0;i<WAVES.length;i++){const w=WAVES[i],c=i%2,r=Math.floor(i/2),x=6+c*(cw+4),y=70+r*36,on=LABSEL.wave===w.k;
+  rrect(x,y,cw,32,7);ctx.fillStyle=on?'#2e2a20':'#171b28';ctx.fill();ctx.lineWidth=on?2:1;ctx.strokeStyle=on?'#ffb13b':'#2c3450';ctx.stroke();
+  fitTxt(w.name,x+9,y+16,cw-44,12,on?'#fff':'#c3c9dc','left',900);for(let q=0;q<w.tier;q++)circ(x+cw-12-q*9,y+16,3,on?'#ffb13b':'#6a5a3a');
+  UI.push({x,y,w:cw,h:32,fn:()=>labSet('wave',w.k)});}
+ const w=WAVES.find(q=>q.k===LABSEL.wave)||WAVES[2];let y=70+rows*36+12;
+ txt(w.name+' · '+['FIRST RUN','EARLY','LATE'][w.tier]+' WAVE'+(w.need?' · AFTER '+ETYPES[w.need].name:''),180,y,12,'#ffb13b','center',900);y+=16;
+ for(const l of wrap(w.desc,340,11).slice(0,2)){txt(l,180,y,11,'#e6e9f5','center',500);y+=14;}
+ txt('HUD: '+w.rule,180,y+4,11,'#9aa3bd','center',600);}
+function drawLabBosses(){const cw=172;
+ for(let i=0;i<BOSS_KEYS.length;i++){const k=BOSS_KEYS[i],B=BOSSES[k],c=i%2,r=Math.floor(i/2),x=6+c*(cw+4),y=72+r*70,on=LABSEL.boss===k;
+  rrect(x,y,cw,64,9);ctx.fillStyle=on?'#33202b':'#171b28';ctx.fill();ctx.lineWidth=on?2:1;ctx.strokeStyle=on?'#ff8fb8':'#2c3450';ctx.stroke();
+  fitTxt(B.name,x+cw/2,y+16,cw-12,13,on?'#fff':'#e0c2cf','center',900);wrap(B.tip,cw-14,11).slice(0,3).forEach((l,q)=>txt(l,x+cw/2,y+32+q*12,11,on?'#ffd0e0':'#8a7f8f','center',500));
+  UI.push({x,y,w:cw,h:64,fn:()=>labSet('boss',k)});}
+ const B=BOSSES[LABSEL.boss]||BOSSES.kings;let y=72+2*70+16;
+ txt(B.name,180,y,15,'#ff8fb8','center',900);y+=20;
+ for(const l of wrap(B.d,330,12).slice(0,6)){txt(l,180,y,12,'#e6e9f5','center',500);y+=16;}}
+// what comes after this screen: the next wave and what it asks of you, or the boss and its tip
+function nextLabel(){if(loopRoom())return {t:'Next: the same room again.',d:''};const s=R.plan[R.si+1];
+ if(!s)return {t:'Next: the end of the run.',d:''};
+ if(s.k==='boss'){const B=BOSSES[s.key];return {t:'NEXT · THE BOSS: '+B.name,d:B.tip};}
+ const w=stageWave(s),big=s.big||(!R.practice&&R.heat>=5);return {t:'NEXT · WAVE '+(R.waveN+1)+': '+w.name+(big?' · BIG ENEMIES':''),d:w.desc};}
+// the strip under the room on the screen between waves: your hearts and abilities
+function drawStrip(){ctx.fillStyle='#0b0d14';ctx.fillRect(0,AH,W,H-AH);ctx.fillStyle='#262c40';ctx.fillRect(0,AH,W,2);
+ if(!R||scr!=='gate')return;
+ for(let i=0;i<R.maxH;i++){heart(22+i*22,530,19);if(i<R.hearts){ctx.fillStyle='#ff4b63';ctx.fill();}else{ctx.lineWidth=1.6;ctx.strokeStyle='rgba(255,75,99,0.65)';ctx.stroke();}}
+ txt('LEVEL '+R.level,346,530,13,'#ffd23f','right',800);
+ const ch=Object.keys(R.upg).map(k=>CARDS[k].name+' '+R.upg[k]).join(' · ');
+ wrap(ch||'No abilities yet',340,11).slice(0,3).forEach((l,i)=>txt(l,180,566+i*15,11,'#9fd3ff','center',700));}
+function drawDoor(i){const d=DOORS[i];const g=Math.max(0,R.doorGlow[i]);const a=0.25+g*0.9;const col='rgba(255,220,120,'+a.toFixed(2)+')';ctx.lineWidth=g>0?6:4;ctx.strokeStyle=col;ctx.beginPath();
+ if(d.s===2){ctx.moveTo(d.x-18,1);ctx.lineTo(d.x+18,1);}else if(d.s===0){ctx.moveTo(1,d.y-18);ctx.lineTo(1,d.y+18);}else{ctx.moveTo(W-1,d.y-18);ctx.lineTo(W-1,d.y+18);}ctx.stroke();
+ if(g>0){ctx.fillStyle='rgba(255,220,120,'+(g*0.35).toFixed(2)+')';circ(d.x,d.y,22*(1-g*0.5)+8,ctx.fillStyle);}}
+// shape says the colour too: green = circle, blue = square, grey = hexagon. HP pips above anything with more than 1 HP.
+function shapePath(c,x,y,r){ctx.beginPath();if(c==='y'){for(let i=0;i<3;i++){const a=-Math.PI/2+i*TAU/3;const px=x+Math.cos(a)*r*1.25,py=y+Math.sin(a)*r*1.25;if(i===0)ctx.moveTo(px,py);else ctx.lineTo(px,py);}ctx.closePath();}
+ else if(c==='b'){const k=r*0.92;ctx.moveTo(x-k,y-k);ctx.lineTo(x+k,y-k);ctx.lineTo(x+k,y+k);ctx.lineTo(x-k,y+k);ctx.closePath();}
+ else if(c==='x'){for(let i=0;i<6;i++){const a=Math.PI/6+i*TAU/6,px=x+Math.cos(a)*r*1.06,py=y+Math.sin(a)*r*1.06;if(i)ctx.lineTo(px,py);else ctx.moveTo(px,py);}ctx.closePath();}
+ else ctx.arc(x,y,r,0,TAU);}
+// a burrower under the floor: a moving mound, and a ring where it will come up
+function drawUnder(e){const s=e.s;ctx.fillStyle='#5a4330';ctx.beginPath();ctx.ellipse(e.x,e.y,e.r*0.9,e.r*0.5,0,0,TAU);ctx.fill();for(let i=0;i<3;i++)circ(e.x+(Math.random()*2-1)*e.r,e.y+(Math.random()*2-1)*4,2,'#8a6a48');
+ const k=1-clamp(s.t/2,0,1),rr=(R?R.ball.r:12)+e.r;ctx.setLineDash([4,4]);circ(s.tx,s.ty,rr,null,'rgba(255,90,60,'+(0.35+0.55*k).toFixed(2)+')',2+2*k);ctx.setLineDash([]);
+ txt(Math.max(0.1,s.t).toFixed(1),s.tx,s.ty,10,'rgba(255,140,110,0.9)','center',800);}
+// the body in its colour; two-tone is split down the middle (green half toward tA)
+function enemyBody(e,x,y,r,fl){
+ if(e.ec==='t'){const a=e.tA,half=(a0,c)=>{ctx.beginPath();ctx.moveTo(x,y);ctx.arc(x,y,r,a0,a0+Math.PI);ctx.closePath();ctx.fillStyle=fl?'#ffffff':colOf(c);ctx.fill();if(SET.cb&&c==='b'&&!fl)stripes(x,y,r);};half(a-Math.PI/2,'g');half(a+Math.PI/2,'b');
+  ctx.lineWidth=2;ctx.strokeStyle='#1c2236';ctx.beginPath();ctx.arc(x,y,r,0,TAU);ctx.stroke();ctx.beginPath();ctx.moveTo(x+Math.cos(a+Math.PI/2)*r,y+Math.sin(a+Math.PI/2)*r);ctx.lineTo(x-Math.cos(a+Math.PI/2)*r,y-Math.sin(a+Math.PI/2)*r);ctx.stroke();return;}
+ shapePath(e.ec,x,y,r);ctx.fillStyle=fl?'#ffffff':colOf(e.ec);ctx.fill();if(SET.cb&&e.ec==='b'&&!fl){stripes(x,y,r);shapePath(e.ec,x,y,r);}ctx.lineWidth=e.boss?3:2;ctx.strokeStyle=darkOf(e.ec);ctx.stroke();}
+// COLOUR-BLIND PATTERNS: blue gets dark diagonal stripes, clipped to the current path
+function stripes(x,y,r){ctx.save();ctx.clip();ctx.strokeStyle='rgba(6,12,36,0.6)';ctx.lineWidth=Math.max(1.5,r*0.16);ctx.beginPath();for(let k=-2*r;k<=2*r;k+=Math.max(5,r*0.5)){ctx.moveTo(x+k-r,y-r);ctx.lineTo(x+k+r,y+r);}ctx.stroke();ctx.restore();}
+// small marks that tell the kinds apart
+function enemyGlyph(e,x,y,r,icon){const s=e.s||{},D='rgba(8,12,22,0.78)',fa=e.face||0,fx=Math.cos(fa),fy=Math.sin(fa);ctx.lineCap='round';ctx.lineJoin='round';
+ const line=(x1,y1,x2,y2,c,w)=>{ctx.strokeStyle=c||D;ctx.lineWidth=w||2;ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();};
+ switch(e.type){
+ case 'zig':ctx.strokeStyle=D;ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(x-r*0.62,y+r*0.5);ctx.lineTo(x-r*0.22,y+r*0.18);ctx.lineTo(x+r*0.2,y+r*0.5);ctx.lineTo(x+r*0.62,y+r*0.18);ctx.stroke();break;
+ case 'burrower':for(const k of [-0.5,0,0.5]){const a=fa+k;line(x+Math.cos(a)*r*0.8,y+Math.sin(a)*r*0.8,x+Math.cos(a)*r*1.3,y+Math.sin(a)*r*1.3,'#e8dcc8',2);}break;
+ case 'charger':{const a=s.st==='rush'||s.st==='glow'?Math.atan2(s.dy||fy,s.dx||fx):fa;for(const sd of [-1,1]){const b0=a+sd*0.55;ctx.fillStyle='#f0e6d0';ctx.beginPath();ctx.moveTo(x+Math.cos(b0)*r*0.8,y+Math.sin(b0)*r*0.8);ctx.lineTo(x+Math.cos(a+sd*0.3)*r*1.5,y+Math.sin(a+sd*0.3)*r*1.5);ctx.lineTo(x+Math.cos(b0+sd*0.35)*r*0.9,y+Math.sin(b0+sd*0.35)*r*0.9);ctx.fill();}break;}
+ case 'spitter':circ(x+fx*r*0.55,y+fy*r*0.55,r*0.28,'#3a0f18');break;
+ case 'flipper':ctx.strokeStyle=D;ctx.lineWidth=2;ctx.beginPath();ctx.arc(x,y,r*0.5,-2.6,0.2);ctx.stroke();ctx.beginPath();ctx.arc(x,y,r*0.5,0.55,3.3);ctx.stroke();break;
+ case 'splitter':line(x,y-r*0.85,x,y+r*0.85,D,2);break;
+ case 'nest':for(const [a,d] of [[0.3,0.45],[2.3,0.5],[4.3,0.4]])circ(x+Math.cos(a)*r*d,y+Math.sin(a)*r*d,r*0.2,'#16213a');
+  if(!icon){ctx.strokeStyle='rgba(255,255,255,0.6)';ctx.lineWidth=2;ctx.beginPath();ctx.arc(x,y,r+5,-Math.PI/2,-Math.PI/2+TAU*(1-clamp(s.t/4,0,1)));ctx.stroke();}break;
+ case 'medic':ctx.fillStyle='#ffffff';ctx.fillRect(x-r*0.18,y-r*0.6,r*0.36,r*1.2);ctx.fillRect(x-r*0.6,y-r*0.18,r*1.2,r*0.36);break;
+ case 'bomber':line(x,y-r*0.8,x+r*0.35,y-r*1.35,'#d9c8a0',2);if(!icon)circ(x+r*0.35,y-r*1.35,2+Math.sin(scrT*25),'#ffd23f');break;
+ case 'king':{ctx.fillStyle='#ffd23f';ctx.beginPath();const cy=y-r*0.95;ctx.moveTo(x-r*0.6,cy+6);ctx.lineTo(x-r*0.6,cy-6);ctx.lineTo(x-r*0.3,cy);ctx.lineTo(x,cy-9);ctx.lineTo(x+r*0.3,cy);ctx.lineTo(x+r*0.6,cy-6);ctx.lineTo(x+r*0.6,cy+6);ctx.closePath();ctx.fill();break;}
+ case 'knight':{ctx.save();ctx.translate(x,y);ctx.rotate(fa);ctx.fillStyle='#c9d2e6';rrect(r*0.05,-r*0.55,r*0.6,r*1.1,4);ctx.fill();ctx.fillStyle='#1b2030';ctx.fillRect(r*0.3,-r*0.4,r*0.12,r*0.8);ctx.restore();break;}
+ case 'jugg':{ctx.strokeStyle='#d9dfe8';ctx.lineWidth=5;ctx.beginPath();ctx.arc(x,y,r-3,fa-1.2,fa+1.2);ctx.stroke();ctx.lineWidth=3;ctx.beginPath();ctx.arc(x,y,r-3,fa+Math.PI-0.9,fa+Math.PI+0.9);ctx.stroke();
+  for(const sd of [-1,1]){const a=fa+sd*0.7;ctx.fillStyle='#f0e6d0';ctx.beginPath();ctx.moveTo(x+Math.cos(a)*r*0.9,y+Math.sin(a)*r*0.9);ctx.lineTo(x+Math.cos(a-sd*0.25)*r*1.45,y+Math.sin(a-sd*0.25)*r*1.45);ctx.lineTo(x+Math.cos(a+sd*0.3)*r*0.95,y+Math.sin(a+sd*0.3)*r*0.95);ctx.fill();}
+  if(s.st==='crack'){ctx.strokeStyle='#ffd23f';ctx.lineWidth=2.5;ctx.beginPath();ctx.moveTo(x-r*0.5,y-r*0.6);ctx.lineTo(x-r*0.1,y-r*0.1);ctx.lineTo(x-r*0.35,y+r*0.2);ctx.lineTo(x+r*0.1,y+r*0.6);ctx.moveTo(x-r*0.1,y-r*0.1);ctx.lineTo(x+r*0.45,y-r*0.25);ctx.stroke();}break;}
+ }}
+function drawEnemy(e,tx,ty,icon){const b=R&&R.ball;if(tx==null){tx=b?b.x:e.x;ty=b?b.y:e.y+10;}const s=e.s||{};
+ if(e.under&&!icon){drawUnder(e);return;}
+ ctx.save();
+ if(e.boss&&!e.boss.active)ctx.globalAlpha=clamp(e.boss.t/1.5,0.1,1);
+ const st=e.stun>0&&!icon,g=icon?null:e.lg;if(st){const j=Math.floor(scrT*30)%4;ctx.translate(j===0?2:j===2?-2:0,j===1?2:j===3?-2:0);}
+ let yo=0;if(e.air&&!icon){ctx.save();ctx.globalAlpha*=0.35;ctx.fillStyle='#000';ctx.beginPath();ctx.ellipse(s.tx,s.ty+e.r*0.4,e.r,e.r*0.45,0,0,TAU);ctx.fill();ctx.restore();ctx.setLineDash([3,3]);circ(s.tx,s.ty,e.r+3,null,'rgba(255,90,60,0.6)',1.5);ctx.setLineDash([]);yo=-(s.h||0);}
+ if(g&&g.ph===0){const k=1-clamp(g.t/LUNGE_CROUCH,0,1);ctx.translate(e.x,e.y);ctx.scale(1+0.2*k,1-0.2*k);ctx.translate(-e.x,-e.y);}
+ const x=e.x,y=e.y+yo,r=e.r,fl=e.hitT>0&&!icon;
+ if(!icon){
+  if(e.type==='charger'&&s.st==='glow'){ctx.save();ctx.globalAlpha*=0.35+0.4*(1-clamp(s.t/0.9,0,1));circ(x,y,r+9,'#ff4b4b');ctx.restore();}
+  if(e.target){ctx.setLineDash([3,4]);circ(x,y,r+6,null,'rgba(255,210,63,0.8)',2);ctx.setLineDash([]);}}
+ enemyBody(e,x,y,r,fl);
+ if(e.paintT>0&&!icon){ctx.setLineDash([3,3]);shapePath(e.paint,x,y,r+5);ctx.lineWidth=3;ctx.strokeStyle=colOf(e.paint);ctx.stroke();ctx.setLineDash([]);}
+ enemyGlyph(e,x,y,r,icon);
+ if(e.type!=='nest')eyes(x,y,e.boss?r*0.8:r,tx,ty,'#0d1a10');
+ if(e.hp>1&&!e.boss&&!icon){const n=Math.min(e.hp,8);for(let i=0;i<n;i++)circ(x+(i-(n-1)/2)*7,y-r-9,2.2,'#eef1fa');if(e.hp>8)txt('+',x+(n/2)*7+5,y-r-9,10,'#eef1fa','left',900);}
+ if(e.front||(R&&R.heat>=3&&e.type==='tank')){ctx.beginPath();ctx.arc(x,y,r+4,e.face-1.2,e.face+1.2);ctx.lineWidth=4;ctx.lineCap='round';ctx.strokeStyle='#eef1fa';ctx.stroke();}
+ if(e.boss&&e.shell&&e.boss.active){ctx.setLineDash([6,5]);circ(x,y,r+5,null,e.armorT>0?'#ffffff':'rgba(217,223,232,0.75)',3);ctx.setLineDash([]);}
+ // twists are pictures, not words: BIG has a double white outline, GOLDEN a gold ring with two sparks going round it
+ if(e.el==='Big'&&!icon){circ(x,y,r+3,null,'rgba(255,255,255,0.85)',2.5);circ(x,y,r+7,null,'rgba(255,255,255,0.4)',1.5);}
+ if(e.el==='Golden'&&!icon){circ(x,y,r+3,null,'#ffd23f',3);for(let i=0;i<2;i++){const a=scrT*4+i*Math.PI;circ(x+Math.cos(a)*(r+7),y+Math.sin(a)*(r+7),2.6,'#fff3b0');}}
+ // the first body of a kind you have never seen carries its name for a few seconds
+ if(e.nameT>0&&!icon){ctx.save();ctx.globalAlpha*=clamp(e.nameT/0.6,0,1);let ny=y-r-(e.hp>1?22:13);if(ny<14)ny=y+r+14;ctx.font='900 12px '+FONT;const nw=ctx.measureText(ETYPES[e.type].name).width+12,nx=clamp(x,nw/2+2,W-nw/2-2),nyy=clamp(ny,12,AH-12);
+  rrect(nx-nw/2,nyy-9,nw,18,6);ctx.fillStyle='rgba(8,10,18,0.8)';ctx.fill();txt(ETYPES[e.type].name,nx,nyy,12,'#ffd23f','center',900);ctx.restore();}
+ // frozen: an ice shell, edged in the freeze's colour
+ if(e.frz>0){shapePath(e.ec==='t'?'g':e.ec,x,y,r+3);ctx.fillStyle='rgba(220,246,255,0.5)';ctx.fill();ctx.lineWidth=2;ctx.strokeStyle=e.frz<0.6&&Math.floor(scrT*12)%2?'#ffffff':colOf(e.frzC||'w');ctx.stroke();}
+ // lunge tell: red arc on the side facing the ball while crouching, solid while dashing
+ if(g){const a=g.ph===0?Math.atan2(ty-e.y,tx-e.x):Math.atan2(g.uy,g.ux);ctx.beginPath();ctx.arc(x,y,r+5,a-0.7,a+0.7);ctx.lineWidth=3;ctx.lineCap='round';ctx.strokeStyle=g.ph===0?'rgba(255,75,75,'+(0.45+0.5*(1-clamp(g.t/LUNGE_CROUCH,0,1))).toFixed(2)+')':'#ff4b4b';ctx.stroke();}
+ if(st){ctx.globalAlpha=0.3;circ(x,y,r+4,'#ffffff');ctx.globalAlpha=1;}
+ else if(!icon&&(e.daze>0||s.dizzy>0)){for(let i=0;i<3;i++){const a=scrT*9+i*TAU/3;circ(x+Math.cos(a)*(r+6),y-4+Math.sin(a)*(r+6)*0.45,2.2,s.dizzy>0?'#ffd23f':'#ffffff');}}
+ ctx.restore();}
+// the practice list's little picture of an enemy kind
+function drawEnemyIcon(type,x,y,r,ec){const T=ETYPES[type];let c=ec||T.ec;if(c==='e')c='g';const e={type,ec:c,x,y,r,hp:1,maxHp:1,s:{},face:0,tA:0.6,el:'',stun:0,daze:0,frz:0,hitT:0,paintT:0};
+ if(type==='shield')e.front=true;drawEnemy(e,x+20,y,true);}
+// THE WALL: a slab with a face on the front and a glowing weak spot on its back (the top)
+function drawWallBoss(k){const bs=R.boss;const fl=bs&&bs.hitT>0;rrect(k.x,k.y,k.w,k.h,6);ctx.fillStyle=fl?'#ffffff':'#4a3a5e';ctx.fill();ctx.lineWidth=3;ctx.strokeStyle='#2a1f38';ctx.stroke();
+ for(let i=1;i<5;i++){ctx.strokeStyle='rgba(20,14,30,0.5)';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(k.x+i*k.w/5,k.y+8);ctx.lineTo(k.x+i*k.w/5,k.y+k.h-4);ctx.stroke();}
+ if(bs){const p=0.65+0.35*Math.sin(scrT*6);ctx.globalAlpha=p;rrect(k.x+6,k.y-3,k.w-12,8,4);ctx.fillStyle=bs.armorT>0?'#ffffff':colOf(bs.col);ctx.fill();ctx.globalAlpha=1;
+  shapePath(bs.col,k.x+k.w/2,k.y-14,6);ctx.fillStyle=colOf(bs.col);ctx.fill();
+  const b=R.ball;eyes(k.x+k.w/2,k.y+k.h-6,22,b.x,b.y+60,'#ffd0e0');ctx.fillStyle='#1a1024';for(let i=0;i<6;i++)ctx.fillRect(k.x+k.w/2-30+i*11,k.y+k.h-6,6,5);}}
+// the boss bar along the top of the room. It turns see-through while the boss is up under it, and shows the boss's tip for the first 12 s.
+function drawBossBar(){const bs=R.boss;if(!bs||R.phase!=='boss')return;const pct=bossFrac();
+ const under=bs.parts.some(p=>!p.dead&&p.y-p.r<64)||(bs.wall&&bs.wall.y<64);ctx.save();if(under)ctx.globalAlpha=0.45;
+ ctx.fillStyle='rgba(0,0,0,0.5)';rrect(60,10,240,14,7);ctx.fill();if(pct>0){ctx.fillStyle=bs.phase===2?'#ff5f8f':'#ff8fb8';rrect(60,10,Math.max(14,240*pct),14,7);ctx.fill();}
+ fitTxt(bs.name+(bs.phase===2?' · PHASE 2':''),180,36,320,14,'#ff8fb8','center',800);
+ if(bs.rev)txt('KILL THE OTHER KING IN '+Math.ceil(bs.rev.t)+' S',180,54,12,'#ffd23f','center',800);
+ else if(!bs.active||bs.t<12)fitTxt(BOSSES[bs.key].tip,180,54,344,11,'#ffd0e0','center',600);
+ ctx.restore();
+ if(bs.rev){const p=0.5+0.5*Math.sin(scrT*8);ctx.globalAlpha=0.5+0.4*p;circ(bs.rev.x,bs.rev.y,24,null,colOf(bs.rev.ec),3);ctx.globalAlpha=1;txt(Math.ceil(bs.rev.t)+'',bs.rev.x,bs.rev.y,18,colOf(bs.rev.ec),'center',900);}}
+// enemy shots, marks on the floor, slime, paint, sniper lines and pair hands
+function drawFloorFx(){
+ for(const s of R.slime){const a=0.13*(1-clamp((s.t-s.life+1.2)/1.2,0,1));circ(s.x,s.y,s.r,'rgba(190,200,70,'+a.toFixed(3)+')');}
+ for(const p of R.patches){const a=0.42*(1-clamp((p.t-p.life+1.5)/1.5,0,1));ctx.save();ctx.globalAlpha=a;circ(p.x,p.y,p.r,colOf(p.c));ctx.globalAlpha=a*0.9;for(let i=0;i<5;i++){const an=i*1.3+p.x;circ(p.x+Math.cos(an)*p.r*0.95,p.y+Math.sin(an)*p.r*0.95,p.r*0.22,colOf(p.c));}ctx.restore();}}
+function drawMarks(){for(const m of R.marks){const k=clamp(m.t/m.T,0,1),col=m.kind==='paint'?colOf(m.c):'#ff5a3c';ctx.setLineDash([5,4]);circ(m.x,m.y,m.r,null,col,2);ctx.setLineDash([]);circ(m.x,m.y,m.r*(1-k),null,col,2);
+  // the shell flies in an arc from the shooter
+  const px=m.sx+(m.x-m.sx)*k,py=m.sy+(m.y-m.sy)*k-Math.sin(Math.PI*k)*80;circ(px,py,m.kind==='paint'?7:5,m.kind==='paint'?col:'#2b3248','#ffffff',1.5);}}
+function drawShots(){for(const s of R.shots){if(s.kind==='bullet')circ(s.x,s.y,s.r,s.refl?'#ffffff':'#ffd23f','#7a5a10',1.5);else{circ(s.x,s.y,s.r,s.refl?'#ffffff':colOf(s.c),'#ffffff',1.5);circ(s.x-2,s.y-2,2,'rgba(255,255,255,0.8)');}}
+ for(const e of R.enemies){if(e.dead||e.type!=='jugg'||e.s.st!=='aim'||!e.boss||!e.boss.active)continue;const s=e.s,end=rayEnd(e.x,e.y,s.dx,s.dy);ctx.setLineDash([8,6]);ctx.strokeStyle=s.t<0.4?'#ff2a2a':'rgba(255,90,60,0.5)';ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(e.x,e.y);ctx.lineTo(end.x,end.y);ctx.stroke();ctx.setLineDash([]);}}
+function drawTethers(){ctx.strokeStyle='rgba(255,255,255,0.55)';ctx.lineWidth=2;for(const e of R.enemies){if(e.dead||e.type!=='runner'||!e.mate||e.mate.dead)continue;ctx.beginPath();ctx.moveTo(e.x,e.y);ctx.lineTo(e.mate.x,e.mate.y);ctx.stroke();}}
+// enemies about to appear inside the room (a closing ring) show a ring first
+function drawPending(){for(const p of R.pending){if(p.door>=0)continue;const k=1-clamp(p.t/1.4,0,1);ctx.setLineDash([4,3]);circ(p.x,p.y,10+8*(1-k),null,'rgba(255,220,120,'+(0.7+0.3*k).toFixed(2)+')',3);ctx.setLineDash([]);}}
+// a pickup: its colour's shape (blue square, green circle; wild = circle with a spinning two-colour ring), the power-up's picture,
+// and a ring that drains to the moment it vanishes (it blinks for the last 2 s)
+function drawPickup(q){const left=q.life-q.t;if(left<2&&Math.floor(q.t*8)%2===0)ctx.globalAlpha=0.35;const col=colOf(q.c),k0=q.t<0.15?0.25+0.75*q.t/0.15:1,r=PU_R*(1+0.06*Math.sin(q.t*7))*k0;
+ ctx.save();ctx.globalAlpha*=0.22;circ(q.x,q.y,r+9,col);ctx.restore();
+ shapePath(q.c==='w'?'g':q.c,q.x,q.y,r);ctx.fillStyle='#0f1220';ctx.fill();ctx.lineWidth=3;ctx.strokeStyle=col;ctx.stroke();
+ if(q.c==='w'){ctx.lineWidth=3;for(let i=0;i<6;i++){ctx.strokeStyle=i%2?colOf('b'):colOf('g');ctx.beginPath();ctx.arc(q.x,q.y,r+5,q.t*3+i*TAU/6,q.t*3+(i+0.7)*TAU/6);ctx.stroke();}}
+ else{ctx.lineWidth=2;ctx.strokeStyle=col;ctx.beginPath();ctx.arc(q.x,q.y,r+6,-Math.PI/2,-Math.PI/2+TAU*clamp(left/q.life,0,1));ctx.stroke();}
+ drawCardIcon(q.k,q.x,q.y,col,0.48*k0);ctx.globalAlpha=1;}
+function drawArena(){
+ const b=R.ball,s=R.shake;let shx=0,shy=0;if(s.t>0){const k=s.t/0.2,w=Math.sin(s.t*140);shx=s.dx*s.mag*k*w+(Math.random()*2-1)*s.mag*k*0.5;shy=s.dy*s.mag*k*w+(Math.random()*2-1)*s.mag*k*0.5;}
+ ctx.save();ctx.beginPath();ctx.rect(0,0,W,AH);ctx.clip();ctx.translate(shx,shy);
+ ctx.fillStyle='#141828';ctx.fillRect(-10,-10,W+20,AH+20);
+ // ice patches sit on the floor, under everything
+ for(const i of R.ice){circ(i.x,i.y,i.r,'rgba(170,225,255,0.14)','rgba(205,240,255,0.5)',2);ctx.strokeStyle='rgba(235,250,255,0.55)';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(i.x-i.r*0.45,i.y-i.r*0.1);ctx.lineTo(i.x-i.r*0.2,i.y-i.r*0.35);ctx.moveTo(i.x+i.r*0.05,i.y+i.r*0.3);ctx.lineTo(i.x+i.r*0.35,i.y+i.r*0.05);ctx.stroke();}
+ drawFloorFx();
+ // blocks: built ones grow in and show bricks; sliding ones show arrows; THE WALL is drawn as the boss
+ for(const k of R.blocks){if(k.boss){drawWallBoss(k);continue;}const gk=k.built?clamp(k.t,0.05,1):1;ctx.save();ctx.globalAlpha=gk;
+  rrect(k.x,k.y,k.w,k.h,4);ctx.fillStyle=b.thru?'rgba(47,55,84,0.55)':k.built?'#454b63':'#2f3754';ctx.fill();ctx.lineWidth=2;ctx.strokeStyle=k.mv?'#8a94b8':'#58628a';ctx.stroke();
+  if(k.built){ctx.strokeStyle='rgba(15,18,30,0.7)';ctx.lineWidth=1.5;ctx.beginPath();ctx.moveTo(k.x+2,k.y+k.h/2);ctx.lineTo(k.x+k.w-2,k.y+k.h/2);ctx.moveTo(k.x+k.w/2,k.y+2);ctx.lineTo(k.x+k.w/2,k.y+k.h/2);ctx.moveTo(k.x+k.w/4,k.y+k.h/2);ctx.lineTo(k.x+k.w/4,k.y+k.h-2);ctx.moveTo(k.x+k.w*0.75,k.y+k.h/2);ctx.lineTo(k.x+k.w*0.75,k.y+k.h-2);ctx.stroke();}
+  if(k.mv){const d=k.mv.spd>0?1:-1,cy=k.y+k.h/2;ctx.strokeStyle='rgba(200,210,240,0.6)';ctx.lineWidth=2;ctx.beginPath();for(const cx of [k.x+k.w*0.3,k.x+k.w*0.5,k.x+k.w*0.7]){ctx.moveTo(cx-3*d,cy-4);ctx.lineTo(cx+3*d,cy);ctx.lineTo(cx-3*d,cy+4);}ctx.stroke();}
+  ctx.restore();}
+ ctx.strokeStyle='rgba(255,255,255,0.035)';ctx.lineWidth=1;ctx.beginPath();for(let x=50;x<W;x+=50){ctx.moveTo(x,0);ctx.lineTo(x,AH);}for(let y=50;y<AH;y+=50){ctx.moveTo(0,y);ctx.lineTo(W,y);}ctx.stroke();
+ for(const c of R.chunks){if(c.t<0.6){ctx.globalAlpha=1;circ(c.x,c.y,c.r,c.col);}else{ctx.globalAlpha=Math.max(0,0.5*(1-(c.t-0.6)/2.4));circ(c.x,c.y,c.r,'#59607a');}}ctx.globalAlpha=1;
+ for(const f of R.fires){const k=f.t/f.life,a=(k<0.8?0.5:0.5*(1-(k-0.8)/0.2))*(0.85+0.15*Math.sin(scrT*20+f.x));const fc=f.c==='w'?'255,230,200':f.c==='b'?'74,120,245':f.c==='y'?'255,210,63':'143,242,110';circ(f.x,f.y,f.r,'rgba('+fc+','+(a*0.35).toFixed(2)+')');circ(f.x,f.y,f.r*0.55,'rgba('+fc+','+(a*0.6).toFixed(2)+')');}
+ for(const bu of R.bumpers){ctx.fillStyle='rgba(214,189,140,0.16)';circ(bu.x,bu.y,bu.r+8,ctx.fillStyle);circ(bu.x,bu.y,bu.r,bu.hitT>0?'#ffffff':'#4a4232','#e3cfa4',3);circ(bu.x,bu.y,4,'#e3cfa4');}
+ for(const k of R.kegs){if(k.dead)continue;const lit=k.lit>0&&Math.floor(scrT*30)%2===0;rrect(k.x-11,k.y-13,22,26,6);ctx.fillStyle=lit?'#ffffff':'#8a5328';ctx.fill();ctx.lineWidth=2;ctx.strokeStyle='#3a200c';ctx.stroke();
+  ctx.fillStyle='#c33d2e';ctx.fillRect(k.x-11,k.y-6,22,4);ctx.fillRect(k.x-11,k.y+3,22,4);ctx.strokeStyle='#ffb13b';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(k.x,k.y-13);ctx.quadraticCurveTo(k.x+6,k.y-19,k.x+3,k.y-23);ctx.stroke();circ(k.x+3,k.y-23,2+Math.sin(scrT*18)*1,'#ffd23f');}
+ for(const q of R.pickups)drawPickup(q);
+ for(const r of R.rings){const k=r.t/r.life;ctx.globalAlpha=1-k;ctx.lineWidth=6*(1-k)+2;ctx.strokeStyle=r.col;circ(r.x,r.y,r.r*(0.3+0.7*k),null,r.col,ctx.lineWidth);}ctx.globalAlpha=1;
+ for(let i=0;i<6;i++)drawDoor(i);
+ for(const st of R.stomps){ctx.lineWidth=10;ctx.strokeStyle=b.hot?'rgba(255,120,80,0.35)':'rgba(255,90,60,0.85)';circ(st.x,st.y,st.r,null,ctx.strokeStyle,10);}
+ for(const p of R.parts){ctx.globalAlpha=1-p.t/p.life;circ(p.x,p.y,p.r,p.col);}ctx.globalAlpha=1;
+ drawPending();drawTethers();
+ for(const e of R.enemies)if(!e.dead)drawEnemy(e);
+ drawMarks();drawShots();
+ for(const m of R.minis){ctx.globalAlpha=clamp((m.life-m.t)/0.3,0.2,1);circ(m.x,m.y,m.r,colOf(m.c),'#ffffff',m.multi?2:1.5);}ctx.globalAlpha=1;
+ // TIME STOP: a grey wash over the frozen room (the ball and the twin stay bright)
+ if(fxOn('TimeStop')){ctx.fillStyle='rgba(160,170,210,0.16)';ctx.fillRect(-10,-10,W+20,AH+20);}
+ if(fxOn('Tilt')&&R.tilt)drawTilt();
+ for(const bo of R.bolts)drawBolt(bo);
+ drawTwin();
+ const aim=scr!=='play'?null:P.aim?{v:launchFromPull(),g:firePoint()}:buffered?{v:buffered,g:firePoint(),queued:true}:null;
+ drawBall(aim&&!aim.queued?aim:null);
+ if(aim)drawAimLine(aim);
+ // hit pops come after the ball and its glow so they stay readable
+ // in a boss fight, pops stay below the boss bar and its tip line
+ const popTop=R.boss&&R.phase==='boss'?76:0;
+ for(const p of R.pops){const k=p.t/p.life;ctx.globalAlpha=k<0.6?1:1-(k-0.6)/0.4;const sz=p.size*(k<0.1?0.6+4*k:1);ctx.font='900 '+sz+'px '+FONT;const hw=ctx.measureText(p.txt).width/2+2;txt(p.txt,clamp(p.x,hw,W-hw),clamp(p.y,Math.max(popTop,sz*0.6),AH-sz*0.6),sz,p.col,'center',900);}ctx.globalAlpha=1;
+ if(C.thorns){ctx.fillStyle='rgba(255,233,160,0.55)';const ts=4+C.thorns;for(let x=12;x<W;x+=24){ctx.beginPath();ctx.moveTo(x-ts,0);ctx.lineTo(x,ts*1.6);ctx.lineTo(x+ts,0);ctx.fill();ctx.beginPath();ctx.moveTo(x-ts,AH);ctx.lineTo(x,AH-ts*1.6);ctx.lineTo(x+ts,AH);ctx.fill();}
+  for(let y=12;y<AH;y+=24){ctx.beginPath();ctx.moveTo(0,y-ts);ctx.lineTo(ts*1.6,y);ctx.lineTo(0,y+ts);ctx.fill();ctx.beginPath();ctx.moveTo(W,y-ts);ctx.lineTo(W-ts*1.6,y);ctx.lineTo(W,y+ts);ctx.fill();}}
+ // walls: gold while BANK BONUS runs, sandy with BOUNCY WALLS
+ const bankOn=fxOn('BankBonus');ctx.lineWidth=3;for(let i=0;i<4;i++){const f=R.wflash[i]>0;ctx.strokeStyle=f?(SET.fewFlash?'#8a94b8':'#ffffff'):bankOn?'#ffd23f':C.bouncy?'#c9a76a':'#3a4262';ctx.lineWidth=f?6:bankOn?4:3;ctx.beginPath();if(i===0){ctx.moveTo(1.5,0);ctx.lineTo(1.5,AH);}else if(i===1){ctx.moveTo(W-1.5,0);ctx.lineTo(W-1.5,AH);}else if(i===2){ctx.moveTo(0,1.5);ctx.lineTo(W,1.5);}else{ctx.moveTo(0,AH-1.5);ctx.lineTo(W,AH-1.5);}ctx.stroke();}
+ drawHoles();
+ drawBossBar();
+ if(R.flash>0){ctx.fillStyle='rgba(255,40,40,'+(R.flash*(SET.fewFlash?0.4:1.2)).toFixed(2)+')';ctx.fillRect(-10,-10,W+20,AH+20);}
+ if(R.hearts===1&&scr==='play'){const a=SET.fewFlash?0.22:0.18+0.18*Math.sin(scrT*7.5);const g=ctx.createRadialGradient(180,250,150,180,250,330);g.addColorStop(0,'rgba(255,0,0,0)');g.addColorStop(1,'rgba(255,0,0,'+a.toFixed(2)+')');ctx.fillStyle=g;ctx.fillRect(0,0,W,AH);}
+ if(R.practice&&scr==='play')txt('PRACTICE',8,AH-12,10,'rgba(208,124,255,0.7)','left',900);
+ ctx.restore();}
+// WRAP HOLES: a dark gap in the wall with bright ends and arrows pointing through
+function drawHoles(){if(!R.holes.length)return;const a=(0.55+0.3*Math.sin(scrT*4)).toFixed(2);
+ for(const h of R.holes){const m=(h.a+h.b)/2;ctx.fillStyle='#05060a';ctx.strokeStyle='rgba(159,230,255,'+a+')';ctx.lineWidth=3;ctx.beginPath();
+  if(h.s<2){const x=h.s===0?0:W;ctx.fillRect(h.s===0?0:W-5,h.a,5,h.b-h.a);ctx.moveTo(x,h.a);ctx.lineTo(h.s===0?9:W-9,h.a);ctx.moveTo(x,h.b);ctx.lineTo(h.s===0?9:W-9,h.b);const d=h.s===0?-1:1,cx=h.s===0?12:W-12;ctx.moveTo(cx-4*d,m-6);ctx.lineTo(cx+4*d,m);ctx.lineTo(cx-4*d,m+6);}
+  else{const y=h.s===2?0:AH;ctx.fillRect(h.a,h.s===2?0:AH-5,h.b-h.a,5);ctx.moveTo(h.a,y);ctx.lineTo(h.a,h.s===2?9:AH-9);ctx.moveTo(h.b,y);ctx.lineTo(h.b,h.s===2?9:AH-9);const d=h.s===2?-1:1,cy=h.s===2?12:AH-12;ctx.moveTo(m-6,cy-4*d);ctx.lineTo(m,cy+4*d);ctx.lineTo(m+6,cy-4*d);}
+  ctx.stroke();}}
+// TILT: chevrons sliding toward the wall the floor tips to
+function drawTilt(){const s=R.tilt.side,o=(scrT*90)%40;ctx.strokeStyle='rgba(208,124,255,0.35)';ctx.lineWidth=4;ctx.beginPath();
+ for(let k=0;k<4;k++)for(let j=0;j<4;j++){const t=40+k*40+o,u=70+j*120;let x,y,dx,dy;if(s<2){x=s===0?W-t:t;y=u;dx=s===0?-1:1;dy=0;}else{x=u-20;y=s===2?AH-t:t;dx=0;dy=s===2?-1:1;}
+  if(x<0||x>W||y<0||y>AH)continue;ctx.moveTo(x-dx*6-dy*8,y-dy*6-dx*8);ctx.lineTo(x+dx*6,y+dy*6);ctx.lineTo(x-dx*6+dy*8,y-dy*6+dx*8);}
+ ctx.stroke();}
+function drawBolt(bo){const a=1-bo.t/bo.life;const path=()=>{ctx.beginPath();for(let i=0;i<bo.pts.length;i++){const p=bo.pts[i];if(!i){ctx.moveTo(p.x,p.y);continue;}const q=bo.pts[i-1];for(let s=1;s<=4;s++){const t=s/4,j=s<4?7:0;ctx.lineTo(q.x+(p.x-q.x)*t+(Math.random()*2-1)*j,q.y+(p.y-q.y)*t+(Math.random()*2-1)*j);}}};
+ ctx.globalAlpha=a*0.45;ctx.strokeStyle=colOf(bo.c);ctx.lineWidth=7;path();ctx.stroke();ctx.globalAlpha=a;ctx.strokeStyle='#ffffff';ctx.lineWidth=2.5;path();ctx.stroke();ctx.globalAlpha=1;}
+function drawTwin(){const t=R.twin.b;if(!t)return;const hc=colOf(colourNow(t));
+ if(t.hot&&t.trail.length>1){ctx.lineCap='round';for(let i=1;i<t.trail.length;i++){const p0=t.trail[i-1],p1=t.trail[i],k=i/t.trail.length;ctx.globalAlpha=0.4*k;ctx.strokeStyle=hc;ctx.lineWidth=t.r*1.5*k;ctx.beginPath();ctx.moveTo(p0.x,p0.y);ctx.lineTo(p1.x,p1.y);ctx.stroke();}ctx.globalAlpha=1;}
+ ctx.globalAlpha=t.idle>0?clamp(1-t.idle/0.7,0,1):1;circ(t.x,t.y,t.r,t.hot?hc:'#8d93a3','#ffffff',2);ctx.setLineDash([3,3]);circ(t.x,t.y,t.r+4,null,hc,1.5);ctx.setLineDash([]);ctx.globalAlpha=1;}
+function drawBall(aim){const b=R.ball;const s=Math.hypot(b.vx,b.vy);const c=colourNow(b),hc=colOf(c);
+ if(b.hot&&b.trail.length>1){const red=clamp((480-s)/180,0,1);ctx.lineCap='round';for(let i=1;i<b.trail.length;i++){const p0=b.trail[i-1],p1=b.trail[i],k=i/b.trail.length;
+  ctx.globalAlpha=(0.08+0.55*k)*(1-0.5*red);ctx.strokeStyle=hc;ctx.lineWidth=b.r*1.7*k*clamp(s/900,0.4,1);ctx.beginPath();ctx.moveTo(p0.x,p0.y);ctx.lineTo(p1.x,p1.y);ctx.stroke();}ctx.globalAlpha=1;}
+ if(b.hot){const g=ctx.createRadialGradient(b.x,b.y,b.r*0.5,b.x,b.y,b.r*2.8);ctx.globalAlpha=0.5;g.addColorStop(0,hc);g.addColorStop(1,'rgba(0,0,0,0)');circ(b.x,b.y,b.r*2.8,g);ctx.globalAlpha=1;}
+ // at rest and ready: a soft white pulse so your ball stands out from everything else
+ else if(!aim&&scr==='play'&&(R.phase==='wave'||R.phase==='boss')){const p=0.5+0.5*Math.sin(scrT*4);circ(b.x,b.y,b.r+5+2*p,null,'rgba(255,255,255,'+(0.22+0.3*p).toFixed(2)+')',2);}
+ const blink=b.inv>0&&Math.floor(b.inv*15)%2===0;ctx.save();ctx.translate(b.x,b.y);let sx=1,sy=1,rot=0,ac=null;
+ if(aim){const v=aim.v;if(v){ac=fxOn('Star')?'w':v.tier;if(v.heavy){sx=1.18;sy=1.18;}else{rot=Math.atan2(v.vy,v.vx);sx=1+0.15*v.pw;sy=1-0.12*v.pw;}}}
+ const sc0=R.intro>0?1+2.2*(R.intro/0.5):1,pk=b.punch>0?1.3:1;ctx.rotate(rot);ctx.scale(sx*sc0*pk,sy*sc0*pk);
+ const fillC=blink?'rgba(255,120,120,0.55)':ac?colOf(ac):b.hot?hc:'#b9c0d0';
+ circ(0,0,b.r,fillC,b.hot||ac?'#ffffff':'#e6e9f5',2);
+ // the ball shows its colour's shape (square = blue, circle = green)
+ const sc=ac||(b.hot?c:null);if(sc&&!blink){shapePath(sc==='w'?'g':sc,0,0,b.r*0.45);ctx.fillStyle='rgba(8,12,28,0.75)';ctx.fill();}
+ for(let i=0;i<b.shield;i++){ctx.setLineDash([4,3]);circ(0,0,b.r+5+i*4,null,'#9fe6ff',2);ctx.setLineDash([]);}ctx.restore();
+ // RAINBOW STAR: a spinning two-colour ring
+ if(fxOn('Star')){ctx.lineWidth=3;for(let i=0;i<6;i++){ctx.strokeStyle=i%2?colOf('b'):colOf('g');ctx.beginPath();ctx.arc(b.x,b.y,b.r+7,scrT*5+i*TAU/6,scrT*5+(i+0.7)*TAU/6);ctx.stroke();}}
+ // the chain count sits beside the ball (not in front of upward shots), at most 24 px
+ if(b.chain>0&&scr==='play'&&(b.hot||b.coldT<0.3)){const size=Math.min(24,14+Math.min(b.chain,10)+(b.chainPop>0?2:0)),side=b.x<W-70?1:-1;txt('x'+b.chain,b.x+side*(b.r+22),clamp(b.y,size,AH-size),size,b.last==='wall'?'#ffd23f':'#fff','center',900);}}
+// the line runs to bounce aimB + a stub ending in a chevron (keeps going), or, when the flick would go cold first, to the cold point,
+// then a faint tail for the cold roll and a grey ball at the exact stop. With CHAMELEON each piece takes the colour the ball will have there.
+// While launch is locked out the line starts from firePoint(), shown as a dashed ghost. With TWIN a faint dashed line shows the twin's first bounce.
+function drawAimLine(aim){const v=aim.v;if(!v)return;ctx.save();if(aim.queued)ctx.globalAlpha=0.6;drawAimLine0(aim);ctx.restore();}
+function strokePts(pts,i0,i1){ctx.beginPath();ctx.moveTo(pts[i0].x,pts[i0].y);for(let i=i0+1;i<i1;i++){const p=pts[i];if(p.w)ctx.moveTo(p.x,p.y);else ctx.lineTo(p.x,p.y);}ctx.stroke();}
+function drawAimLine0(aim){const v=aim.v;const b=R.ball,g=aim.g;const sim=simLine(g.x,g.y,v.vx,v.vy,b.r,C.aimB,R.bumpers,true,v.heavy,b.thru);
+ const base=fxOn('Star')?'w':v.tier,pts=sim.pts,nMain=sim.cold?sim.coldI+1:pts.length;
+ // colour changes along the path (CHAMELEON, FLIP SIDE)
+ const cuts=[];if(base!=='w'&&C.cham){let flips=0,white=false,cur=base;const fs=hasCombo('FLIP SIDE');for(const e of sim.evs){if(e.k==='wall'||((e.k==='post'||e.k==='block')&&C.cham>=2)||(e.k==='wrap'&&fs)){flips++;if(C.cham>=3&&flips>=3)white=true;const nc=white?'w':flips%2?other(base):base;if(nc!==cur){cuts.push({i:e.i,c:nc});cur=nc;}}}}
+ if(g.ghost){ctx.setLineDash([4,4]);circ(g.x,g.y,b.r,'rgba(255,255,255,0.12)',colOf(base),2);ctx.setLineDash([]);}
+ ctx.lineWidth=2+2*v.pw;ctx.lineJoin='round';ctx.lineCap='round';
+ let i0=0,cur=base;for(const ct of cuts){if(ct.i>=nMain)break;ctx.strokeStyle=colOf(cur);strokePts(pts,i0,ct.i+1);i0=ct.i;cur=ct.c;}ctx.strokeStyle=colOf(cur);strokePts(pts,i0,nMain);
+ for(const d of sim.dots)circ(d.x,d.y,4,'rgba(255,255,255,0.85)');
+ if(sim.cold){ctx.strokeStyle='rgba(255,255,255,0.35)';ctx.lineWidth=2;strokePts(pts,sim.coldI,pts.length);
+  circ(sim.stop.x,sim.stop.y,b.r,'rgba(255,255,255,0.45)','rgba(255,255,255,0.7)',1.5);}
+ else{const n=pts.length,p0=pts[Math.max(0,n-4)],p1=sim.end,a=Math.atan2(p1.y-p0.y,p1.x-p0.x);const ga=ctx.globalAlpha;ctx.globalAlpha=ga*0.7;ctx.strokeStyle=colOf(cur);ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(p1.x-Math.cos(a-0.65)*10,p1.y-Math.sin(a-0.65)*10);ctx.lineTo(p1.x,p1.y);ctx.lineTo(p1.x-Math.cos(a+0.65)*10,p1.y-Math.sin(a+0.65)*10);ctx.stroke();ctx.globalAlpha=ga;}
+ if(R.twin.n>0){const t=twinVel(v),ts=simLine(W-g.x,g.y,t.vx,t.vy,11,1,R.bumpers,true,t.heavy,false),ga=ctx.globalAlpha;ctx.globalAlpha=ga*0.5;ctx.setLineDash([5,6]);ctx.strokeStyle=colOf(t.tc);ctx.lineWidth=2;strokePts(ts.pts,0,ts.cold?ts.coldI+1:ts.pts.length);ctx.setLineDash([]);circ(W-g.x,g.y,9,null,colOf(t.tc),1.5);ctx.globalAlpha=ga;}}
+// the colour meter where your thumb went down: the ring fills blue up to halfway, then green; the loaded colour's shape sits in
+// the middle and its name sits above, so you know what you will fire before you let go
+const RING_R=30;
+function drawAimRing(){const v=launchFromPull();const pw=v?v.pw:0,ax=P.ax,ay=P.ay,a0=-Math.PI/2;
+ const arc=(f0,f1,col,lw)=>{if(f1<=f0)return;ctx.strokeStyle=col;ctx.lineWidth=lw;ctx.beginPath();ctx.arc(ax,ay,RING_R,a0+TAU*f0,a0+TAU*f1);ctx.stroke();};
+ ctx.lineWidth=2;ctx.strokeStyle=v?'rgba(255,255,255,0.7)':'rgba(255,255,255,0.3)';circ(ax,ay,RING_R,null,ctx.strokeStyle,2);
+ ctx.globalAlpha=0.35;arc(0,TIER_B,colOf('b'),7);arc(TIER_B,1,colOf('g'),7);ctx.globalAlpha=1;
+ ctx.strokeStyle='rgba(255,255,255,0.75)';ctx.lineWidth=2;for(const f of [TIER_B]){const t=a0+TAU*f;ctx.beginPath();ctx.moveTo(ax+Math.cos(t)*(RING_R-7),ay+Math.sin(t)*(RING_R-7));ctx.lineTo(ax+Math.cos(t)*(RING_R+7),ay+Math.sin(t)*(RING_R+7));ctx.stroke();}
+ if(v){arc(0,Math.min(pw,TIER_B),colOf('b'),6);arc(TIER_B,pw,colOf('g'),6);
+  const ly=ay-RING_R-16>14?ay-RING_R-16:ay+RING_R+18;ctx.fillStyle='rgba(7,8,12,0.75)';rrect(ax-34,ly-10,68,20,6);ctx.fill();txt(v.tier==='b'?'BLUE':'GREEN',ax,ly,13,colOf(v.tier),'center',900);}
+ ctx.strokeStyle='rgba(255,255,255,0.35)';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(ax,ay);ctx.lineTo(P.x,P.y);ctx.stroke();circ(P.x,P.y,6,v?colOf(v.tier):'rgba(255,255,255,0.5)');
+ if(v){const t=v.tier;shapePath(t,ax,ay,11);ctx.fillStyle=colOf(t);ctx.fill();}}
+function drawHUD(){ctx.fillStyle='#0b0d14';ctx.fillRect(0,AH,W,H-AH);ctx.fillStyle='#262c40';ctx.fillRect(0,AH,W,2);
+ const prev=R.level>1?lvlNeed(R.level-1):0,prog=clamp((R.score-prev)/(R.nextLvl-prev),0,1);ctx.fillStyle='#ffd23f';ctx.fillRect(0,AH,W*prog,3);
+ const hs=R.hearts,mh=R.maxH;const shakeH=R.flash>0?(Math.random()*2-1)*3:0;
+ // hearts you have are filled; hearts lost are outlines
+ for(let i=0;i<mh;i++){heart(22+i*22+shakeH,524,19);if(i<hs){ctx.fillStyle='#ff4b63';ctx.fill();}else{ctx.lineWidth=1.6;ctx.strokeStyle='rgba(255,75,99,0.65)';ctx.stroke();}}
+ // pause button: top-right of the HUD strip, at least 44 px on screen
+ const pb=Math.min(52,Math.max(44,44/sc)),pbx=W-6-pb,pby=AH+6,r2=Math.max(566,pby+pb+16);
+ txt(fmt(R.gt),pbx-10,524,20,'#fff','right',800);
+ if(scr==='play'){rrect(pbx,pby,pb,pb,10);ctx.fillStyle=paused?'#2a3350':'#1b2030';ctx.fill();ctx.lineWidth=2;ctx.strokeStyle='#4a5478';ctx.stroke();const cx=pbx+pb/2,cy=pby+pb/2;ctx.fillStyle='#eef1fa';
+  if(paused){ctx.beginPath();ctx.moveTo(cx-6,cy-9);ctx.lineTo(cx+9,cy);ctx.lineTo(cx-6,cy+9);ctx.closePath();ctx.fill();}else{ctx.fillRect(cx-7,cy-9,5,18);ctx.fillRect(cx+2,cy-9,5,18);}
+  UI.push({x:pbx,y:pby,w:pb,h:pb,fn:()=>setPause(!paused)});}
+ const wl=R.inBoss?'BOSS':loopRoom()||R.wv&&R.wv.k==='test'?'WAVE '+R.wave:'WAVE '+R.wave+'/'+totalWaves();fitTxt(wl,10,r2,72,13,'#9aa3bd','left',800);
+ // what is left to kill, by colour (HIVES counts its nests)
+ const L=leftByCol();let rule=R.inBoss&&R.boss?BOSSES[R.boss.key].tip:R.wv?R.wv.rule||R.wv.desc:'',rc='#cfd6ee';
+ if(R.wv&&!R.inBoss){if(R.wv.hives){const n=R.enemies.filter(e=>!e.dead&&e.type==='nest').length;txt('NESTS '+n+'/3',88,r2,15,'#fff','left',800);}
+  else{txt('LEFT',88,r2,11,'#7f88a6','left',800);let lx=122;for(const c of 'gbt'){if(!L[c]&&c==='t')continue;
+   if(c==='t'){for(const [a0,cc] of [[Math.PI/2,'g'],[-Math.PI/2,'b']]){ctx.beginPath();ctx.moveTo(lx,r2);ctx.arc(lx,r2,6.5,a0,a0+Math.PI);ctx.closePath();ctx.fillStyle=L[c]?colOf(cc):'#3a4262';ctx.fill();}}
+   else{shapePath(c,lx,r2,6);ctx.fillStyle=L[c]?colOf(c):'#3a4262';ctx.fill();if(SET.cb&&c==='b'&&L[c])stripes(lx,r2,6);}
+   txt(''+L[c],lx+11,r2,16,L[c]?'#fff':'#55607a','left',800);lx+=42;}
+   // one colour left: say which pull it needs
+   if(!L.t&&(L.b>0)!==(L.g>0)){const c=L.b?'b':'g';rule=L[c]+' '+colName(c)+' LEFT: '+TIER_NAME[c];rc=colOf(c);}}}
+ ctx.font='800 18px '+FONT;const sw=ctx.measureText(''+R.score).width;txt(''+R.score,350,r2,18,fxOn('Gold')?'#ffd23f':'#fff','right',800);txt('SCORE',350-sw-6,r2,11,'#7f88a6','right',800);
+ if(rule)fitTxt(rule,180,r2+24,344,12,rc,'center',700);
+ if(R.first&&R.flicks===0&&R.wave===1&&scr==='play'){const a=0.5+0.5*Math.sin(scrT*6);txt('PULL BACK AND LET GO',180,466,18,'rgba(255,210,63,'+a.toFixed(2)+')','center',900);}
+ else if(R.first&&R.wv&&R.wv.k==='first2'&&R.heavyN===0&&scr==='play'){const a=0.5+0.5*Math.sin(scrT*6);txt('PULL JUST A LITTLE FOR BLUE',180,466,16,'rgba(120,170,255,'+a.toFixed(2)+')','center',900);}
+ if(paused){const chips=Object.keys(R.upg).map(k=>CARDS[k].name+' '+R.upg[k]).concat(COMBOS.filter(c=>hasCombo(c.name)).map(c=>'★'+c.name)).join(' · ');
+  const cl=wrap(chips||'No abilities yet',344,11);for(let i=0;i<Math.min(2,cl.length);i++)txt(cl[i]+(i===1&&cl.length>2?' …':''),180,612+i*14,11,'#9fd3ff','center',700);return;}
+ // owned power-ups: picture and name, and a bar that fills up to the next pickup (or drains, in the effect's colour, while it runs)
+ const pk=Object.keys(R.upg).filter(k=>famOf(k)==='POWER');let x=10;
+ for(const k of pk){const f=R.fx[k],on=!!(f&&f.t>0),p=R.pu[k],col=on?colOf(f.c):FAM.POWER.col;
+  rrect(x,602,110,34,8);ctx.fillStyle='#151927';ctx.fill();ctx.lineWidth=on?2:1;ctx.strokeStyle=on?col:'#2c3450';ctx.stroke();
+  drawCardIcon(k,x+18,619,col,0.6);fitTxt(CARDS[k].name,x+35,612,k==='Twin'&&R.twin.n>0?46:70,11,on?'#fff':'#9aa3bd','left',800);
+  let frac=0;if(on)frac=clamp(f.t/f.max,0,1);else if(p)frac=1-clamp(p.t/puEvery(k,R.upg[k]),0,1);
+  rrect(x+35,623,66,5,2);ctx.fillStyle='#262c40';ctx.fill();if(frac>0){rrect(x+35,623,Math.max(4,66*frac),5,2);ctx.fillStyle=on?col:'#8a5fb0';ctx.fill();}
+  if(k==='Twin'&&R.twin.n>0)txt('×'+R.twin.n,x+104,612,11,'#fff','right',900);
+  x+=116;}}
+// the one screen between waves: what you cleared, how many picks you have and why, what is next, three cards and healing
+function drawGate(){ctx.fillStyle='rgba(5,6,12,0.9)';ctx.fillRect(0,0,W,AH);const ready=scrT>=GATE_GUARD;
+ fitTxt(R.clearTitle||(R.wv?R.wv.name+' CLEAR':'WAVE '+R.wave+' CLEAR'),180,28,340,26,'#7dffa0','center',900);
+ const tot=R.pickN+R.picksOwed,why=[];if(R.gateLvl)why.push(R.gateLvl>1?R.gateLvl+' LEVEL-UPS':'LEVEL-UP');for(const r of R.rewards)why.push(r);
+ fitTxt('PICK '+(R.pickN+1)+' OF '+tot+(tot>1&&why.length?'  ·  EXTRA FOR: '+why.join(', '):''),180,54,344,13,tot>1?'#ffd23f':'#cfd6ee','center',800);
+ const nx=nextLabel();fitTxt(nx.t,180,74,344,12,'#ffb13b','center',800);if(nx.d){const dl=wrap(nx.d,340,11);for(let q=0;q<Math.min(2,dl.length);q++)txt(dl[q]+(q===1&&dl.length>2?'…':''),180,90+q*13,11,'#cfd6ee','center',500);}
+ if(R.gateMode)txt(R.gateMode==='banish'?'TAP AN ABILITY TO BANISH IT':'TAP AN ABILITY TO LOCK IT',180,120,12,'#ffd23f','center',800);
+ else{txt(R.sel==null?'TAP TWICE TO TAKE':'TAP AGAIN TO TAKE',10,120,11,R.sel==null?'#7f88a6':'#ffd23f','left',800);txt('TERRAIN '+famCount('TERRAIN')+'/3 · POWER-UPS '+famCount('POWER')+'/3',350,120,11,'#7f88a6','right',700);}
+ const k=clamp(gateAnim/0.3,0,1),yoff=(1-k)*(1-k)*240;ctx.save();if(!ready)ctx.globalAlpha=0.55;
+ for(let i=0;i<3;i++){const x=6+i*118,y=130+yoff,w=112,h=214;const nm=R.offer[i];if(!nm)continue;const cd=CARDS[nm],fm=FAM[cd.fam],lvN=(R.upg[nm]||0)+1,cbs=combosFor(nm);
+  rrect(x,y,w,h,12);ctx.fillStyle='#1b2030';ctx.fill();
+  ctx.save();rrect(x,y,w,h,12);ctx.clip();ctx.globalAlpha*=0.16;ctx.fillStyle=fm.col;ctx.fillRect(x,y,w,22);ctx.restore();
+  rrect(x,y,w,h,12);ctx.lineWidth=cbs.length?3:2;ctx.strokeStyle=cbs.length?'#ffd23f':fm.col;ctx.stroke();
+  txt(fm.name,x+w/2,y+11,11,fm.col,'center',900);
+  fitTxt(cd.name,x+w/2,y+35,w-10,13.5,'#fff','center',900);
+  drawCardIcon(nm,x+w/2,y+66,fm.col);
+  for(let q=0;q<3;q++){rrect(x+w/2-13.5+q*10,y+89,7,5,1.5);ctx.fillStyle=q<lvN?'#ffd23f':'#2c3450';ctx.fill();}
+  fitTxt((lvN===1?'NEW':'LEVEL '+lvN)+(cd.fam==='POWER'?' · EVERY '+puEvery(nm,lvN)+'S':''),x+w/2,y+103,w-8,11,cd.fam==='POWER'?'#e2b8ff':'#9aa3bd','center',800);
+  const dl=wrap(cd.d[lvN-1],w-10,11),lh=cbs.length?12.5:13.5;let ly=y+120;for(const l of dl.slice(0,cbs.length?4:6)){txt(l,x+w/2,ly,11,'#e6e9f5','center',500);ly+=lh;}
+  if(cbs.length){fitTxt('★ '+cbs[0].name,x+w/2,y+h-38,w-10,11,'#ffd23f','center',900);const cl=wrap(cbs[0].d,w-10,11);for(let q=0;q<Math.min(2,cl.length);q++)txt(cl[q]+(q===1&&cl.length>2?'…':''),x+w/2,y+h-24+q*12,11,'#fff3c0','center',500);}
+  else if(cd.wild)txt('WILD: ANY BALL',x+w/2,y+h-12,11,'#ffffff','center',800);
+  else if(cd.fam==='POWER')txt('Match its colour',x+w/2,y+h-12,11,'#b7a3d6','center',600);
+  if(R.lockedShown===nm){rrect(x+w/2-30,y-9,60,16,6);ctx.fillStyle='#ffd23f';ctx.fill();txt('LOCKED',x+w/2,y-1,11,'#10131d','center',900);}
+  if(R.gateMode){ctx.setLineDash([5,4]);ctx.lineWidth=2;ctx.strokeStyle=R.gateMode==='banish'?'#ff6b6b':'#ffd23f';rrect(x-3,y-3,w+6,h+6,14);ctx.stroke();ctx.setLineDash([]);}
+  UI.push({x,y,w,h,fn:()=>gateTap(i)});}
+ // the chosen card gets a gold edge and TAP AGAIN; the others dim
+ if(R.sel!=null&&R.sel<3&&!R.gateMode)for(let i=0;i<3;i++){if(!R.offer[i])continue;const x=6+i*118,y=130+yoff,w=112,h=214;
+  if(i===R.sel){ctx.lineWidth=4;ctx.strokeStyle='#ffd23f';rrect(x-2,y-2,w+4,h+4,13);ctx.stroke();rrect(x+6,y+h-30,w-12,24,8);ctx.fillStyle='#ffd23f';ctx.fill();txt('TAP AGAIN',x+w/2,y+h-18,12,'#10131d','center',900);}
+  else{rrect(x,y,w,h,12);ctx.fillStyle='rgba(5,6,12,0.6)';ctx.fill();}}
+ const py=352+yoff;
+ // healing uses a pick (heat 4+: no healing, so the button skips the pick)
+ const again=R.sel===3;
+ if(R.heat>=4)button(50,py,260,42,again?'TAP AGAIN TO SKIP':'SKIP · no healing at heat '+R.heat,again?'#ffd23f':'#9fd3ff',()=>gateTap(3),13);
+ else{const full=R.hearts>=R.maxH,cap=healCap();const stuck=!canHeal()&&!R.offer.length;const lb=stuck?'CONTINUE':full?(R.maxH<cap?'HEAL: +1 MAX HEART':'HEARTS FULL'):'HEAL +2 ♥  ('+R.hearts+'/'+R.maxH+')';
+  button(50,py,260,42,again?'TAP AGAIN: '+lb:lb,again?'#ffd23f':stuck?'#7dffa0':canHeal()?'#ff4b63':'#3a4262',()=>gateTap(3),again?13:15);}
+ // reroll always; banish and lock only once the workshop has unlocked them
+ const T=lvR('tools'),tools=[['↻ REROLL '+R.reroll,'#ffd23f',R.reroll>0,doReroll]];
+ if(T>=2)tools.push([R.gateMode==='banish'?'BANISH ✓':'BANISH '+R.banishes,'#ff6b6b',R.banishes>0,()=>setGateMode('banish')]);
+ if(T>=3)tools.push([R.gateMode==='lock'?'LOCK ✓':'LOCK '+R.locks,'#9fd3ff',R.locks>0,()=>setGateMode('lock')]);
+ const tw=104,gap=10,tx0=180-(tools.length*tw+(tools.length-1)*gap)/2;
+ tools.forEach((t,i)=>button(tx0+i*(tw+gap),py+52,tw,40,t[0],t[2]?t[1]:'#3a4262',t[2]?t[3]:()=>{sfx.cancel();},13));
+ ctx.restore();}
+// the end of a run. Its buttons wait END_GUARD s, so a tap meant for the last shot cannot skip the results; only the buttons start anything.
+const END_GUARD=1.5;
+function drawEnd(){ctx.fillStyle='#05060c';ctx.fillRect(0,0,W,AH);const dead=scr==='over';
+ txt(dead?'RUN OVER':'YOU WIN',180,54,38,dead?'#ff6b6b':'#7dffa0','center',900);
+ const rc={S:'#ffd23f',A:'#7dffa0',B:'#9fd3ff',C:'#cfd6ee',D:'#ff9f3c',E:'#ff6b6b'}[R.rank]||'#fff';
+ txt('RANK',130,104,14,'#7f88a6','center',700);txt(R.rank,130,146,64,rc,'center',900);
+ txt(dead?'reached':'cleared',248,104,14,'#7f88a6','center',700);fitTxt(dead?(R.inBoss&&R.boss?R.boss.name:'WAVE '+R.wave):(R.clearName||'THE RUN'),248,138,170,20,'#fff','center',900);
+ txt(R.practice?'PRACTICE':R.daily?'DAILY RUN · '+R.daily.day:'RUN '+META.runs+(R.heat>1?' · HEAT '+R.heat:''),180,84,12,R.daily?'#5ec8ff':'#9aa3bd','center',800);
+ const rows=[['TIME',fmt1(R.clearTime),R.nb.time],['BEST CHAIN',''+R.bestChain,R.nb.chain],['SCORE',''+R.score,R.nb.score]];
+ let y=206;for(const r of rows){txt(r[0],40,y,15,'#7f88a6','left',700);txt(r[1],250,y,18,'#fff','right',800);if(r[2])txt('NEW BEST',262,y,12,'#ffd23f','left',900);y+=28;}
+ if(R.practice)txt('PRACTICE RUN · NO XP',180,312,20,'#d07cff','center',900);else txt('+'+R.xpGain+' XP',180,312,28,'#ffd23f','center',900);
+ let ny=344;if(R.newHeat){txt('HEAT '+META.heatMax+' UNLOCKED: harder rules, more XP',180,ny,13,'#ff8a5c','center',900);ny+=20;}
+ if(R.met){txt('NEW ENEMY MET: '+ETYPES[R.met].name,180,ny,13,'#ffd23f','center',900);ny+=20;}
+ if(R.newCard){const c=CARDS[R.newCard];txt('NEW CARD: '+c.name+' ('+FAM[c.fam].name+')',180,ny,13,FAM[c.fam].col,'center',900);ny+=20;}
+ if(R.daily&&META.daily&&META.daily.day===R.daily.day){txt((R.nb.daily?'NEW ':'')+'TODAY\'S BEST: '+META.daily.best+'  ·  TRIES: '+META.daily.tries,180,ny,13,'#5ec8ff','center',900);ny+=20;}
+ if(scrT>END_GUARD){rrect(40,400,170,50,10);ctx.fillStyle='#ffd23f';ctx.fill();txt('PLAY AGAIN',125,425,18,'#10131d','center',900);UI.push({x:40,y:400,w:170,h:50,fn:()=>R.practice?startPractice():R.daily?startDaily():startRun()});
+  button(100,458,160,36,'TITLE','#9fd3ff',()=>{scr='title';scrT=0;sfx.click(1);},14);
+  if(R.practice)button(222,400,98,50,'PRACTICE','#d07cff',()=>{scr='lab';scrT=0;sfx.click(1);},13);
+  else button(222,400,98,50,'WORKSHOP','#7dffa0',()=>{scr='shop';scrT=0;sfx.click(1);},13);}}
+function render(){ctx.setTransform(1,0,0,1,0,0);ctx.fillStyle='#07080c';ctx.fillRect(0,0,cv.width,cv.height);ctx.setTransform(dpr*sc,0,0,dpr*sc,ox*dpr,oy*dpr);UI=[];
+ if(scr==='title'){drawTitle();return;}
+ if(scr==='shop'){drawShop();return;}
+ if(scr==='settings'){drawSettings();return;}
+ if(scr==='lab'){drawLab();return;}
+ if(!R)return;drawArena();if(scr==='play')drawHUD();else drawStrip();if(P.aim&&scr==='play')drawAimRing();
+ if(scr==='gate')drawGate();else if(scr==='over'||scr==='clear')drawEnd();
+ if(paused&&scr==='play')drawPause();
+ if(!SET.sound){txt('muted',346,AH-12,12,'#55607a','right',600);}}
+// pause: RESUME is big and on top. QUIT (the run stays saved, but this wave starts again) and RESTART sit at the bottom and need a second tap.
+function drawPause(){ctx.fillStyle='rgba(5,6,12,0.85)';ctx.fillRect(0,0,W,AH);txt('PAUSED',180,80,36,'#fff','center',900);
+ button(70,118,220,60,'RESUME','#7dffa0',()=>setPause(false),22);
+ button(80,192,200,44,'SOUND: '+soundLabel(),'#b48cff',()=>{cycleSound();save();sfx.click(2);},16);
+ const armed=k=>R.armed===k&&scrT-R.armT<3,arm=k=>{R.armed=k;R.armT=scrT;sfx.click(1);};
+ txt(R.practice?'These end the run:':'QUIT saves your run. This wave starts over.',180,330,11,'#7f88a6','center',600);
+ button(80,346,200,42,armed('quit')?'TAP AGAIN TO QUIT':R.practice?'QUIT TO PRACTICE':'QUIT TO TITLE','#9aa3bd',()=>{if(!armed('quit')){arm('quit');return;}R.armed=null;keepHurt();paused=false;P.aim=false;buffered=null;scr=R.practice?'lab':'title';scrT=0;sfx.click(1);},15);
+ button(80,398,200,42,armed('restart')?'TAP AGAIN TO RESTART':'RESTART','#ff8a5c',()=>{if(!armed('restart')){arm('restart');return;}R.practice?startPractice():R.daily?startDaily():startRun();},15);}
+
+// ================= loop =================
+function frame(now){const rdt=Math.min(0.1,Math.max(0,(now-lastT)/1000));lastT=now;update(rdt);render();requestAnimationFrame(frame);}
+if(typeof requestAnimationFrame==='function')requestAnimationFrame(frame);
+window.__bs={update,render,startRun,startPractice,fire,recalc,CARDS,COMBOS,CARD_KEYS,LAB,labTap,colourNow,tierOf,ETYPES,META,TRACKS,buyTrack,leftByCol,setGateMode,makeOffer,canOffer,famCount,combosFor,hasCombo,fxOn,spawnPickup,usePickup,grabCheck,placeTerrain,
+ get scrT(){return scrT;},get R(){return R;},get scr(){return scr;},set scr(v){scr=v;},get paused(){return paused;},get buffered(){return buffered;},P,SET,C,pickCard,patchUp,doReroll,newRun,LABSEL,WAVES,BOSSES,BOSS_KEYS,TWISTS,TWIST_KEYS,ENEMY_KEYS,NEW_ORDER,INTRO,enterRoom,advance,openGate,continueRun,startDaily,saveRun,clearRun,dailyPlan,todayKey,gateTap,STARTER,CARD_UNLOCK,cardOn,get SAVED(){return SAVED;},startBoss,spawnAt,roomFor,buildPlan,introWave,stageWave,nextNew,totalWaves,bossFrac,canHeal,simLine,launchFromPull,firePoint,moveStep,pullFull,setPause,onDown,onMove,onUp,thud,UI:()=>UI};
+</script>
+</body></html>
